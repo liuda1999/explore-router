@@ -1,0 +1,138 @@
+# explore 智能本地路由 —— 唯一配置源
+#
+# 设计原则：
+#   1. slots 的 key 是「角色槽位」，不是某个固定模型；可增删槽位、可换任意模型/量化。
+#      其中必须有且只有一个 resident: true 的前台槽位。
+#   2. 硬件不写死：GPU 数量/品牌/后端由运行时探测，placement 决定各槽位用哪些卡。
+#   3. 环境变量仅用于部署期覆盖，优先级高于本文件（NUM_CTX / API_PORT /
+#      FRONT_PORT / SLOT_PORT / LLAMA_SERVER / LLAMA_LIB_DIR / GPU_BACKEND /
+#      KV_CACHE / SETTINGS_FILE / STARTUP_TIMEOUT_S / REQUEST_TIMEOUT_S /
+#      DATA_DIR / LOG_DIR / QUEUE_MAXSIZE / MAX_OUTPUT_TOKENS）。
+#   4. 改模型只改本文件，不改代码；改完重启服务并跑 tests/run_matrix.sh 回归。
+
+version: 2
+
+runtime:
+  server_bin: /opt/llama.cpp/build/bin/llama-server   # 可换成其它 llama.cpp 兼容运行时
+  lib_dir: /opt/llama.cpp/build/bin
+  gpu_backend: auto                # auto | cuda | rocm | cpu
+  n_gpu_layers: 99                 # 卸载到 GPU 的层数；CPU 后端会被运行时忽略
+  max_output_tokens: 1024          # 后台任务单次生成上限
+  queue_maxsize: 32                # 后台排队上限；满时 /chat 返回 429
+  ports:
+    api: 8100
+    front: 18100
+    slot: 18101
+  startup_timeout_s: 420
+  request_timeout_s: 600
+
+context:
+  num_ctx: auto                   # auto = 按设备显存查 auto_table；也可直接写整数
+  kv_cache: q8_0                  # KV 精度，只影响显存，不改变 num_ctx
+  auto_table:                     # 按 GPU 总显存(MB) 从大到小取第一条命中，可编辑
+    # 项目最低支持 32K；更大上下文需显存实测后加表项，或用 NUM_CTX 临时覆盖。
+    - {min_total_mb: 80000, num_ctx: 65536}
+    - {min_total_mb: 0, num_ctx: 32768}
+
+embedding:
+  onnx: models/embedding/fast-bge-base-zh-v1.5/onnx/model_quantized.onnx
+  tokenizer: models/embedding/fast-bge-base-zh-v1.5/tokenizer.json
+
+# ── 显存预算 ────────────────────────────────────────────────
+# 启动时按实际可见 GPU 的 free_mb、前台常驻占用与本段余量，判断每个槽位能否装下。
+# 装不下的槽位标记 unavailable；重档任务自动降级到 default_slot，不会强行加载导致 OOM。
+budget:
+  reserve_system_mb: 1024         # 系统/驱动预留，按可见卡数分摊
+  headroom_ratio: 0.10            # 显存安全余量（10%）
+
+# ── 槽位定义 ────────────────────────────────────────────────
+# key 仅作标识（front / mid / moe 沿用历史命名，不代表模型类型）。
+# 想换成别的 3B/4B 小量化模型？只改 front.model / quant / weight_mb 即可。
+# 想换成单卡小模型或别的 MoE？同理，改对应槽位，必要时调 placement。
+# placement: auto（自动分配） | spread（跨所有卡按空闲显存比例分层） |
+#            explicit（用 devices 里写死的索引，仅特殊场景使用）
+# 多卡 spread 时若不写 split_ratio，比例按「各卡空闲显存 - 前台预估占用」自动计算；
+# 若设备上还有别的服务占显存导致算偏，可显式写 split_ratio: [1, 2] 之类。
+#
+# vram_mb：权重 + KV 的目标机显存估算，按实测校准；不填则用 weight_mb*1.35+512。
+# 16G 单卡建议：front 用 3B/4B，mid 用 8B/9B Q4，moe 换成 14B Q4 或移除；
+# 35B MoE（vram_mb≈26000）在 16G 单卡会被标记 unavailable，heavy 任务自动降级到 mid。
+slots:
+  front:
+    role: front                   # 前台：始终在线、即时回复、简单任务直接完成
+    model: models/front3b-q6.gguf
+    quant: Q6_K
+    weight_mb: 2700               # 用于多卡自动分层时扣减前台占用，以及文档估算
+    vram_mb: 3800                 # 权重 + KV 的实测估算；可按目标机校准
+    placement: auto
+    resident: true                # 必须且只能有一个槽位为 true
+  mid:
+    role: middle                  # 中档：常规复杂任务
+    model: models/mid9b-q4.gguf
+    quant: Q4_K_M
+    weight_mb: 5600
+    vram_mb: 7600
+    placement: auto
+    resident: false
+  moe:
+    role: heavy                   # 重档：高复杂度任务
+    model: models/moe35b-q4.gguf
+    quant: Q4_K_XL
+    weight_mb: 21300
+    vram_mb: 26000
+    placement: spread             # 多卡时自动分层；单卡时自动退化为单卡
+    # 当前双卡设备的调优值：前台常驻第一张卡，故让重档偏向另一张卡。
+    # 换设备（尤其单卡）时应删除本行，改由「空闲显存 - 前台预估占用」自动计算。
+    split_ratio: [1, 2]
+    resident: false
+
+routing:
+  # 分级名称可按需改（如 quick / standard / deep），但必须是 3 个且与下面映射一致。
+  # 代码只按顺序使用：第 1 个=直接回答，第 2 个=常规后台，第 3 个=重档后台。
+  tier_order: [simple, mid, heavy]
+  tier_to_slot:                   # 档位 -> 槽位 key；增删槽位时同步改这里
+    simple: front
+    mid: mid
+    heavy: moe
+  default_slot: mid
+  mid_min_chars: 25
+  heavy_min_chars: 120
+  max_input_chars: auto           # auto = 可用上下文 - 最小历史预算；超限返回 413
+  complex_words:
+    - 详细
+    - 分析
+    - 代码
+    - 方案
+    - 论文
+    - 报告
+    - 设计
+    - 实现
+    - 重构
+    - 深入
+    - 长文
+    - 逐步
+    - 多步
+    - 写一份
+    - 总结一下
+    - 完整
+    - 系统
+    - python
+    - code
+    - analyze
+    - implement
+    - explain in detail
+
+frontend:
+  max_tokens: 256                 # 即时回复上限
+  # 历史预算按 num_ctx 自动计算：短输入多带历史，长输入自动收紧，不写死条数。
+  # 历史预算 = max(history_min_chars, (可用上下文 - 当前输入) * history_budget_ratio)
+  history_budget_ratio: 0.45
+  history_min_chars: 2048         # 至少为历史留出的字符预算；输入上限会相应扣减
+  history_max_messages: 40        # 历史条数上限（防止极端多轮拖慢 prefill）
+  context_safety_tokens: 256      # 留给 token 估算误差与模板开销
+  restart_cooldown_s: 30          # 前台进程异常后的重启冷却，避免反复拉起
+  progress_window_s: 1800         # 进度提问只关联最近 30 分钟内的任务
+  system_prompt: >-
+    你是本地助手的主对话模型，始终在线、回应简洁友好。
+    用户说什么都要有一句着落；简单问题直接答，复杂任务先确认收到并说明会交给后台处理。
+    不要编造后台任务的执行结果。

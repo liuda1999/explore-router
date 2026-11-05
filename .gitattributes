@@ -1,0 +1,25 @@
+# ==========================================================
+# 统一换行符：目标运行环境是 Linux，shell 脚本必须是 LF
+# 避免 Windows checkout 时转成 CRLF 导致 ./run.sh 无法执行
+# ==========================================================
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+*.cfg  text eol=lf
+*.ini  text eol=lf
+
+# 二进制资源不做任何转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gguf binary
+*.onnx binary
+*.zip  binary
+*.pyc  binary
+*.so   binary

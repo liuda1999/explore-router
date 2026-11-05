@@ -1,0 +1,13 @@
+# 运行依赖：目标机 Python 3.10.12 实测版本，固定版本保证 CI 可复现。
+# 安装（不污染系统环境）：
+#   python3 -m pip install --target ./pylib -r requirements.txt
+# 升级任一版本后，必须重跑 tests/ci_integration.sh 的 GPU 集成层。
+fastapi==0.162.0
+uvicorn==0.54.0
+websockets==16.1.1
+httpx==0.28.1
+PyYAML==6.0.3
+numpy==2.2.6
+onnxruntime==1.23.2
+tokenizers==0.23.3
+pytest==9.2.0

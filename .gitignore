@@ -1,0 +1,73 @@
+# ==========================================================
+# explore 智能本地路由 — Git 忽略规则
+# 原则：只提交源码、配置、文档与测试；依赖、模型权重、运行产物一律不入库
+# ==========================================================
+
+# --- Python 依赖与虚拟环境 ---
+venv/
+.venv/
+env/
+pylib/
+site-packages/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- 编辑器 / 操作系统临时文件 ---
+*.swp
+*.swo
+*.swn
+*~
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 模型权重与大体积二进制资源（由 NAS / 目标机提供，不入库）---
+*.gguf
+*.onnx
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.tar.zst
+*.tgz
+*.tar.gz
+*.zip
+*.7z
+*.so
+*.pyd
+*.dll
+*.exe
+*.dylib
+
+# --- 运行时产物（日志、数据库、状态、进程文件、测试结果）---
+*.log
+logs/
+*.db
+*.sqlite
+*.sqlite3
+*.pid
+*.sock
+nohup.out
+matrix_*.json
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# --- 说明 ---
+# storage/task_status/*.json 为旧版历史任务归档，作为项目历史证据保留在库中。
+# 若日后不再需要，追加 storage/task_status/ 即可。

@@ -1,0 +1,286 @@
+# explore · 智能本地路由
+
+### Intelligent Local LLM Router
+
+> **中文**：一个完全跑在本地设备上的**配置驱动路由器**。前台常驻小模型始终与用户对话，简单任务当场答完；复杂任务按设备实时资源交给后台槽位里更合适的模型，结果原样递回。模型、显卡、上下文长度、端口全部来自一份 `settings.yaml`，代码里没有硬件常量，也没有固定模型名。
+>
+> **English**: A **configuration-driven router** that runs entirely on your own hardware. A small always-resident front model answers every single message and closes simple requests instantly; complex work is dispatched — based on live device resources — to a mutually-exclusive backend slot with a more capable model, and the result is handed back verbatim. Models, GPUs, context length and ports all come from one `settings.yaml`. No hardware constants and no hard-coded model names in the code.
+
+**语言 / Language**: [English](#english) · [简体中文](#简体中文)
+
+---
+
+<a id="english"></a>
+
+## English
+
+### What this project is
+
+`explore` is **not a model server and not a chatbot UI**. It is the decision layer in between: it decides *which local model should answer*, keeps one model permanently online so the conversation never stalls, and makes sure the device never runs out of VRAM while switching.
+
+The original constraint was a single 16 GB GPU that could not hold several large models at once. The rewrite generalised that into two durable principles:
+
+1. **A slot is a role, not a model.** `front` / `mid` / `moe` are identifiers. Which GGUF file, which quantisation, how much VRAM it needs and which GPU it lands on are all declared in `settings.yaml`. Slots can be added, removed or renamed.
+2. **Hardware is a runtime fact, not a code constant.** GPU count, vendor, backend (CUDA / ROCm / CPU), free VRAM and the context ceiling are probed at startup. One NVIDIA card, one AMD card, two cards, or no GPU at all require **zero code changes**.
+
+### Key capabilities
+
+| Capability | Behaviour |
+|---|---|
+| **Every message gets a reply** | The resident front model always produces an `instant_reply`, even while a backend job is still running. |
+| **Zero switching for simple work** | Requests routed to `front` are answered immediately; no backend process is ever loaded. |
+| **Mutually-exclusive backend** | At most one backend model is resident. It may stay loaded; it is only replaced when a different tier is requested. |
+| **Constant context window** | `num_ctx` is resolved once at startup and applied to every instance. Switching models never changes it. Minimum supported is **32K**. |
+| **Verbatim result delivery** | Backend output is written to `final_reply` unchanged — the front model does not rewrite or summarise it. |
+| **Observable progress** | Asking "how is it going" attaches the real task state from SQLite, not a generated guess. |
+| **Automatic VRAM guard** | `vram_plan` evaluates visible GPUs at startup. A slot that does not fit is marked `available: false`; heavy requests degrade to `default_slot` instead of OOM-ing. |
+| **Automatic context budget** | History budget scales with `num_ctx` and shrinks when the current input is long. Long chains stay stable and recall stays accurate. |
+| **Portable** | No absolute device paths, no GPU indices, no model file names inside `app/`, `run.sh`, `tests/` or `.github/`. |
+
+### Architecture
+
+```mermaid
+flowchart TD
+    C[Client · session_id] -->|POST /chat| A[FastAPI API layer]
+    A --> S[(SQLite<br/>sessions + task state)]
+    A --> E[ONNX Embedding<br/>semantic cues]
+    A --> F[FRONT slot · resident=true]
+    F -->|simple| D[direct answer · instant_reply]
+    F -->|progress question| P[attach real task state]
+    F -->|complex| Q[short self-contained task package]
+    Q --> R[Router · tier_to_slot]
+    R --> B[BACKEND slot · at most one resident]
+    B --> V[final_reply · verbatim]
+
+    G[settings.yaml] -.-> CFG[config.py]
+    GPU[gpu.py<br/>CUDA / ROCm / CPU probe] -.-> CFG
+    CFG -.-> LL[llama.py<br/>llama-server process manager]
+```
+
+`gpu.py` probes the device, `config.py` resolves every slot's device list and split ratio from that probe plus `settings.yaml`, and `llama.py` only starts processes — it contains no hardware logic.
+
+### Tech stack at a glance
+
+| Layer | Choice |
+|---|---|
+| API | FastAPI 0.162.0 + Uvicorn 0.54.0 (single worker, async queue) |
+| Async HTTP | httpx 0.28.1 |
+| Inference runtime | `llama-server` (llama.cpp), GGUF, OpenAI-compatible endpoints |
+| GPU backends | NVIDIA CUDA / AMD ROCm / CPU, auto-detected |
+| Embedding | ONNX Runtime 1.23.2 + tokenizers 0.23.3 (bge-zh, 1024-d, CPU) |
+| State | SQLite (`messages` + `tasks`), no Redis / Celery / broker |
+| Config | PyYAML 6.0.3, single `settings.yaml` + deployment-time env overrides |
+| Numeric | numpy 2.2.6 |
+| Process control | `run.sh` (idempotent start / stop / restart / status / health), PID file |
+| Tests | Real-machine Python test suite + shell matrix runner + CI static / GPU integration layers |
+
+Full detail, version pinning rationale and alternatives: **[TECH_STACK.md](TECH_STACK.md)**.
+Full step-by-step install: **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+
+### Quick start
+
+```bash
+# 1. Get the code
+git clone https://github.com/liuda1999/explore-router.git
+cd explore-router
+mkdir -p models pylib data logs
+
+# 2. Install pinned dependencies into the workspace (no system pollution, no venv required)
+python3 -m pip install --target ./pylib -r requirements.txt
+
+# 3. Place your GGUF models + ONNX embedding under models/, then edit settings.yaml
+#    - slots.<key>.model      -> your GGUF path
+#    - slots.<key>.vram_mb    -> measured weights + KV for YOUR device
+#    - runtime.server_bin     -> path to llama-server
+#    - context.num_ctx        -> auto (min 32K) or an explicit integer
+
+# 4. Start (idempotent, foreground readiness wait, no boot-time autostart)
+./run.sh start --wait
+
+# 5. Always confirm the *effective* configuration first
+curl -s http://127.0.0.1:8100/config
+curl -s http://127.0.0.1:8100/health
+```
+
+First request:
+
+```bash
+curl -s -X POST http://127.0.0.1:8100/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"user_input":"What is 2+2?","session_id":"demo"}'
+
+curl -s -X POST http://127.0.0.1:8100/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"user_input":"Analyze and design a complete solution","session_id":"demo","prefer_tier":"heavy"}'
+
+curl -s 'http://127.0.0.1:8100/task_result?task_id=<id>'
+```
+
+Stop cleanly (only this project's PID and configured ports are touched):
+
+```bash
+./run.sh stop
+```
+
+> Replace the model files, GPU and context values with whatever your machine actually has. The values shipped in `settings.yaml` are **examples**, not requirements.
+
+### Verified status
+
+Audited on real hardware with real models, real process crashes and real restarts — **no mocks**: API contract 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long-context 15/15 per context tier, 32K/64K/96K matrix 69/69, single-GPU degradation verified, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md). All performance figures there are **device-specific historical measurements**, not project limits.
+
+### Documentation
+
+| Document | Content |
+|---|---|
+| [README.md](README.md) | This bilingual entry point |
+| [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md) | Full project introduction (English) |
+| [PROJECT_INTRO.md](PROJECT_INTRO.md) | 完整项目介绍（中文） |
+| [TECH_STACK.md](TECH_STACK.md) | Technology stack, component choices, version matrix |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Deployment & startup runbook, hardware scenarios, acceptance checklist |
+| [OPERATIONS.md](OPERATIONS.md) | Day-2 operations: swap models / devices, monitoring, troubleshooting, rollback |
+| [AUDIT_REPORT.md](AUDIT_REPORT.md) | Full real-machine audit and CI results |
+| [TEST_REPORT.md](TEST_REPORT.md) | Historical device-specific measurements |
+| [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | Historical development log (requirements evolution, not a current constraint) |
+| [settings.yaml](settings.yaml) | The single source of truth |
+
+### Current boundaries
+
+No authentication, no streaming output, no rate limiting, no automatic log/database rotation — the API binds to `127.0.0.1` and expects a reverse proxy with auth if exposed. AMD ROCm is validated at the config/parse layer but not yet on physical AMD hardware. Details in [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md), section "Known limitations".
+
+---
+
+<a id="简体中文"></a>
+
+## 简体中文
+
+### 项目是什么
+
+`explore` **不是模型服务，也不是聊天界面**，而是夹在用户与本地模型之间的决策层：决定「由哪个本地模型来回答」，让一个模型永久在线以保证对话不中断，并在切换模型时保证设备显存不被撑爆。
+
+最初的约束是「一张 16G 显卡放不下多个大模型」。重写时把它抽象成两条稳定原则：
+
+1. **槽位是角色，不是模型**。`front` / `mid` / `moe` 只是标识；装哪个 GGUF、什么量化、需要多少显存、落在哪张卡，全部在 `settings.yaml` 里声明，槽位可增删改名。
+2. **硬件是运行时事实，不是代码常量**。GPU 数量、品牌、后端（CUDA / ROCm / CPU）、空闲显存、上下文上限都在启动时探测；单卡 N 卡、单卡 A 卡、双卡、无 GPU 都**不需要改代码**。
+
+### 核心能力
+
+| 能力 | 行为 |
+|---|---|
+| **句句有着落** | 常驻前台模型每次都产出 `instant_reply`，即使后台任务还在跑。 |
+| **简单任务零切换** | 路由到 `front` 的请求当场答完，不加载任何后台进程。 |
+| **后台互斥槽位** | 最多一个后台模型驻留；允许一直常驻，只在需要另一档时才换掉。 |
+| **上下文恒定** | `num_ctx` 启动时解析一次并应用到所有实例，切换模型不改变它；最低支持 **32K**。 |
+| **结果原样递回** | 后台输出直接写入 `final_reply`，前台不改写、不整理。 |
+| **进度可观测** | 用户问进度时附加来自 SQLite 的真实任务状态，而不是模型编造。 |
+| **显存自动阈值** | `vram_plan` 按启动期可见 GPU 判断；装不下的槽位标 `available: false`，heavy 自动降级到 `default_slot`，不强行加载导致 OOM。 |
+| **上下文自动预算** | 历史预算随 `num_ctx` 伸缩，当前输入变长时自动收紧，保证长链路稳定与召回准确。 |
+| **可移植** | `app/`、`run.sh`、`tests/`、`.github/` 内无设备绝对路径、无显卡索引、无模型文件名硬编码。 |
+
+### 架构
+
+```mermaid
+flowchart TD
+    C[客户端 · session_id] -->|POST /chat| A[FastAPI 接口层]
+    A --> S[(SQLite<br/>会话历史 + 任务状态)]
+    A --> E[ONNX Embedding<br/>语义线索]
+    A --> F[FRONT 槽位 · resident=true]
+    F -->|简单任务| D[直接回答 · instant_reply]
+    F -->|进度提问| P[附加真实任务状态]
+    F -->|复杂任务| Q[自包含短任务包]
+    Q --> R[Router · tier_to_slot]
+    R --> B[后台互斥槽位 · 最多 1 个]
+    B --> V[final_reply · 原样递回]
+
+    G[settings.yaml] -.-> CFG[config.py]
+    GPU[gpu.py<br/>CUDA / ROCm / CPU 探测] -.-> CFG
+    CFG -.-> LL[llama.py<br/>llama-server 进程管理]
+```
+
+`gpu.py` 探测设备，`config.py` 依据探测结果与 `settings.yaml` 解析每个槽位的设备列表与分层比例，`llama.py` 只负责起停进程，不含任何硬件判断。
+
+### 技术栈速览
+
+| 层次 | 选型 |
+|---|---|
+| 接口 | FastAPI 0.162.0 + Uvicorn 0.54.0（单 worker + asyncio 队列） |
+| 异步 HTTP | httpx 0.28.1 |
+| 推理运行时 | `llama-server`（llama.cpp），GGUF，OpenAI 兼容接口 |
+| GPU 后端 | NVIDIA CUDA / AMD ROCm / CPU，启动期自动探测 |
+| 嵌入 | ONNX Runtime 1.23.2 + tokenizers 0.23.3（中文 bge，1024 维，CPU 执行） |
+| 状态 | SQLite（`messages` + `tasks`），无 Redis / Celery / 消息中间件 |
+| 配置 | PyYAML 6.0.3，唯一 `settings.yaml` + 部署期环境变量覆盖 |
+| 数值 | numpy 2.2.6 |
+| 进程管理 | `run.sh`（幂等 start / stop / restart / status / health）+ PID 文件 |
+| 测试 | 真机 Python 用例 + Shell 矩阵 + CI 静态层 / GPU 集成层 |
+
+完整选型理由、版本固定原因与替代方案见 **[TECH_STACK.md](TECH_STACK.md)**；从零部署步骤见 **[DEPLOYMENT.md](DEPLOYMENT.md)**。
+
+### 快速开始
+
+```bash
+# 1. 获取代码
+git clone https://github.com/liuda1999/explore-router.git
+cd explore-router
+mkdir -p models pylib data logs
+
+# 2. 把固定版本依赖装进工作区（不污染系统，不需要 venv）
+python3 -m pip install --target ./pylib -r requirements.txt
+
+# 3. 把 GGUF 模型与 ONNX 嵌入模型放进 models/，然后编辑 settings.yaml：
+#    - slots.<key>.model     改成你的 GGUF 路径
+#    - slots.<key>.vram_mb   填目标机实测的「权重 + KV」显存
+#    - runtime.server_bin    改成 llama-server 的实际路径
+#    - context.num_ctx       auto（最低 32K）或显式整数
+
+# 4. 启动（幂等；--wait 等待前台就绪；不设开机自启）
+./run.sh start --wait
+
+# 5. 换模型/换设备后，先确认「实际生效」的配置
+curl -s http://127.0.0.1:8100/config
+curl -s http://127.0.0.1:8100/health
+```
+
+第一个请求：
+
+```bash
+curl -s -X POST http://127.0.0.1:8100/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"user_input":"2+2 等于几","session_id":"demo"}'
+
+curl -s -X POST http://127.0.0.1:8100/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"user_input":"请详细分析并给出完整方案","session_id":"demo","prefer_tier":"heavy"}'
+
+curl -s 'http://127.0.0.1:8100/task_result?task_id=<id>'
+```
+
+停止（只处理本项目 PID 与配置中的端口，不做全局清理）：
+
+```bash
+./run.sh stop
+```
+
+> 请把模型文件、显卡与上下文值替换成自己设备的真实情况。`settings.yaml` 里的具体数值只是**示例**，不是运行要求。
+
+### 验证状态
+
+真机、真模型、真实进程故障与真实重启审计，**全程不使用 mock**：API 契约 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、单卡降级已验证、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。其中所有性能数字都是**特定设备的历史实测**，不是项目约束或能力边界。
+
+### 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [README.md](README.md) | 本双语总入口 |
+| [PROJECT_INTRO.md](PROJECT_INTRO.md) | 完整项目介绍（中文） |
+| [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md) | Full project introduction (English) |
+| [TECH_STACK.md](TECH_STACK.md) | 技术栈、组件选型、版本矩阵 |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | 部署与启动流程、硬件场景、验收清单 |
+| [OPERATIONS.md](OPERATIONS.md) | 日常运维：换模型 / 换设备、监控、排障、回滚 |
+| [AUDIT_REPORT.md](AUDIT_REPORT.md) | 全量真机审计与 CI 结果 |
+| [TEST_REPORT.md](TEST_REPORT.md) | 特定设备的历史实测 |
+| [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | 历史开发记录（需求演进，非当前约束） |
+| [settings.yaml](settings.yaml) | 唯一配置源 |
+
+### 当前边界
+
+无鉴权、无流式输出、无速率限制、无日志/数据库自动轮转——默认绑定 `127.0.0.1`，对外暴露必须加反向代理与鉴权。AMD ROCm 已完成代码与配置解析层验证，尚未在 AMD 真机上实测。详见 [PROJECT_INTRO.md](PROJECT_INTRO.md)「已知限制」。
