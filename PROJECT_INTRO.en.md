@@ -1,6 +1,6 @@
 # explore · Intelligent Local LLM Router — Project Introduction
 
-> **Version** v2.2.0 ｜ **Updated** 2026-11-06 ｜ **Configuration-driven edition**
+> **Version** v2.2.1 ｜ **Updated** 2026-11-06 ｜ **Configuration-driven edition**
 > Workspace: `<deployment directory>` (scripts resolve paths from their own location; nothing is hard-coded)
 > Bilingual entry point: [README.md](README.md) ｜ 中文版: [PROJECT_INTRO.md](PROJECT_INTRO.md)
 

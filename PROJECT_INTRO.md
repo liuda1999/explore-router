@@ -1,6 +1,6 @@
 # explore 智能本地路由 — 项目介绍
 
-> **版本** v2.2.0 ｜ **更新** 2026-11-06 ｜ **配置驱动版**
+> **版本** v2.2.1 ｜ **更新** 2026-11-06 ｜ **配置驱动版**
 > 工作区：`<部署目录>`（脚本按自身位置定位，不写死路径）
 > 双语入口：[README.md](README.md) ｜ English edition: [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md)
 
