@@ -357,3 +357,4 @@ Verified: API 27/27, fault injection 10/10, restart recovery 10/10, stability 10
 | [TEST_REPORT.md](TEST_REPORT.md) | Historical device-specific measurements |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | Historical development log (not a current constraint) |
 | [settings.yaml](settings.yaml) | **The single source of truth** |
+| [LICENSE](LICENSE) | Apache License 2.0 |

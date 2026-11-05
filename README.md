@@ -147,6 +147,12 @@ Audited on real hardware with real models, real process crashes and real restart
 
 No authentication, no streaming output, no rate limiting, no automatic log/database rotation — the API binds to `127.0.0.1` and expects a reverse proxy with auth if exposed. AMD ROCm is validated at the config/parse layer but not yet on physical AMD hardware. Details in [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md), section "Known limitations".
 
+### License
+
+Released under the [Apache License 2.0](LICENSE). Copyright 2026 liuda1999.
+
+You may use, modify and redistribute this project, including commercially, provided you retain the copyright and license notices. The license also grants an explicit patent license and requires prominent notices for significant modifications.
+
 ---
 
 <a id="简体中文"></a>
@@ -284,3 +290,9 @@ curl -s 'http://127.0.0.1:8100/task_result?task_id=<id>'
 ### 当前边界
 
 无鉴权、无流式输出、无速率限制、无日志/数据库自动轮转——默认绑定 `127.0.0.1`，对外暴露必须加反向代理与鉴权。AMD ROCm 已完成代码与配置解析层验证，尚未在 AMD 真机上实测。详见 [PROJECT_INTRO.md](PROJECT_INTRO.md)「已知限制」。
+
+### 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 发布，版权归 liuda1999 所有（2026）。
+
+允许商用、修改与再分发，但须保留版权与许可声明；该许可证同时包含明确的专利授权，并要求对重大修改做出显著说明。

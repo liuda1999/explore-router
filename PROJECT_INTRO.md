@@ -357,3 +357,4 @@ GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)�
 | [TEST_REPORT.md](TEST_REPORT.md) | 特定设备的历史实测（带设备相关性声明） |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | 历史开发记录（需求演进，非当前约束） |
 | [settings.yaml](settings.yaml) | **唯一配置源** |
+| [LICENSE](LICENSE) | Apache License 2.0 |
