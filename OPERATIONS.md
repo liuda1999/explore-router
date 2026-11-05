@@ -45,6 +45,7 @@ explore-router/
 │   ├── embed.py           ONNX embedding
 │   ├── store.py           SQLite 任务状态与会话历史
 │   ├── router.py          分级 + 互斥槽位（按 key 操作）
+│   ├── prompts.py         统一消息模板（任务包 / 前缀 / 降级文案）
 │   └── main.py            FastAPI 接口
 ├── models/                GGUF 与 embedding（路径在 settings.yaml 中写）
 ├── pylib/                 Python 依赖

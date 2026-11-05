@@ -105,6 +105,7 @@ flowchart TD
 | `app/embed.py` | ONNX embedding 加载与推理，启动自检输出维度（当前 1024） | 不参与任务分级 |
 | `app/store.py` | SQLite `messages` / `tasks`；合并连续同角色消息、按预算截断并规范化历史、任务状态机、重启恢复 | 无跨会话检索层 |
 | `app/router.py` | 分级、`tier_to_slot` 映射、静态 `VRAM_PLAN` 选槽/降级、后台槽位互斥 `ensure()` | 不假设恰好三个槽位 |
+| `app/prompts.py` | **统一消息模板**：后台 system、任务包、结果/进度前缀、截断标记、降级文案；`PROMPT_VERSION` 标识版本 | 不参与路由决策，不读配置 |
 | `app/main.py` | FastAPI 接口、即时回复、进度附注、任务入队、worker、结果原样写回、`context_usage`、错误码 | 不含业务逻辑以外的硬件逻辑 |
 | `run.sh` | 幂等启停，按脚本位置定位工作区，端口从配置读取，启动前显存预检 | 不写死路径、不做全局 `pkill` |
 
@@ -130,6 +131,26 @@ flowchart TD
 | 测试 / CI | pytest 9.2.0、自研真机 Python/Shell 审计、GitHub Actions | 静态层任意机器、GPU 集成层自托管 runner |
 
 依赖版本全部固定在 [requirements.txt](requirements.txt)，安装方式是 `pip --target ./pylib`，**不污染系统、不依赖 venv、不需要 root**。完整选型理由、版本固定原因、替代方案与兼容矩阵见 **[TECH_STACK.md](TECH_STACK.md)**。
+
+### 5.1 消息契约与标准模板
+
+所有跨模块消息由 `app/prompts.py` 统一生成，`PROMPT_VERSION` 标识模板版本。修改模板只改这一个文件。
+
+| 消息 | 生成位置 | 形态 | 是否写入历史 |
+|---|---|---|---|
+| 前台对话 | `main.py` 组装 | `[system] + 历史 + [user]`，角色严格交替 | 是（只存干净回复，不存进度附注） |
+| 后台任务包 | `prompts.backend_messages()` | `[system] + [user]`；user 为固定顺序的「任务 / 语义线索 / 要求」三段 | 否 |
+| 后台结果（API） | `tasks.final_reply` | 模型原始输出，零改写 | — |
+| 后台结果（历史） | `prompts.history_message()` | `[后台结果] ` + 原始输出 | 是 |
+| 进度附注 | `prompts.progress_note()` | `[后台任务进度] ` + 真实任务状态 | 否（只进即时回复） |
+| 前台降级 | `prompts.front_failure()` | 固定句式，含异常类型，不含堆栈 | 是（作为干净回复） |
+| 超长输入 | `prompts.TRUNCATION_MARK` | 保留首 2/3、尾 1/3，中间标记截断 | 否（仅任务包） |
+
+三条硬约束：
+
+1. **`final_reply` 永远是模型原始输出**，任何前缀都不进入该字段；
+2. **前缀只用于历史或即时回复**，不改变 API 返回的结果本体；
+3. **写入历史的角色必须 user / assistant 交替**：`store.append_message()` 合并连续同角色，`get_history()` 丢弃窗口两端孤立的角色，避免 chat template 因角色不交替返回 500。
 
 ---
 

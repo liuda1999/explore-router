@@ -105,6 +105,7 @@ flowchart TD
 | `app/embed.py` | ONNX embedding load + inference, startup self-check of vector dimension (currently 1024) | Task classification |
 | `app/store.py` | SQLite `messages` / `tasks`; merge consecutive same-role messages, budget-truncate and normalise history, task state machine, restart recovery | Cross-session retrieval |
 | `app/router.py` | Classification, `tier_to_slot` mapping, static `VRAM_PLAN` selection/degradation, mutually-exclusive `ensure()` | Assumption that exactly three slots exist |
+| `app/prompts.py` | **Central message templates**: backend system, task package, result/progress prefixes, truncation marker, degradation text; `PROMPT_VERSION` identifies the revision | No routing decisions, no config access |
 | `app/main.py` | FastAPI endpoints, instant reply, progress attachment, enqueue, worker, verbatim result, `context_usage`, error codes | Hardware logic beyond resolved config |
 | `run.sh` | Idempotent start/stop, workspace resolved from script location, ports from config, pre-start VRAM check | Hard-coded paths, global `pkill` |
 
@@ -130,6 +131,26 @@ flowchart TD
 | Test / CI | pytest 9.2.0, real-machine Python/Shell audits, GitHub Actions | Static layer anywhere, GPU integration on self-hosted runner |
 
 All dependency versions are pinned in [requirements.txt](requirements.txt) and installed with `pip --target ./pylib` — **no system pollution, no venv, no root**. Full rationale, alternatives, and the compatibility matrix are in **[TECH_STACK.md](TECH_STACK.md)**.
+
+### 5.1 Message contract and standard templates
+
+Every cross-module message is produced by `app/prompts.py`; `PROMPT_VERSION` identifies the template revision. Changing a template touches exactly one file.
+
+| Message | Produced by | Shape | Written to history? |
+|---|---|---|---|
+| Front conversation | assembled in `main.py` | `[system] + history + [user]`, strictly alternating roles | Yes (clean reply only, no progress note) |
+| Backend task package | `prompts.backend_messages()` | `[system] + [user]`; the user turn is three fixed-order sections: task / semantic cues / requirements | No |
+| Backend result (API) | `tasks.final_reply` | raw model output, zero rewriting | — |
+| Backend result (history) | `prompts.history_message()` | `[后台结果] ` + raw output | Yes |
+| Progress note | `prompts.progress_note()` | `[后台任务进度] ` + real task state | No (instant reply only) |
+| Front degradation | `prompts.front_failure()` | fixed sentence with exception type, no stack trace | Yes (as a clean reply) |
+| Oversized input | `prompts.TRUNCATION_MARK` | keeps first 2/3 and last 1/3, marks the cut | No (task package only) |
+
+Three hard constraints:
+
+1. **`final_reply` is always the raw model output** — no prefix ever enters that field.
+2. **Prefixes belong to history or instant replies only**, never to the API result body.
+3. **Roles written to history must alternate user / assistant**: `store.append_message()` merges consecutive same-role messages, and `get_history()` drops orphaned roles at both ends, preventing chat-template 500s.
 
 ---
 

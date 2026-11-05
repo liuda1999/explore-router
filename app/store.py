@@ -176,6 +176,10 @@ def get_history(session_id, max_chars=None, max_messages=40):
             out.append(dict(m))
     while out and out[0]["role"] != "user":
         out.pop(0)
+    # 结尾若是孤立的 user（例如上一轮只写入了提问、回复未落库），丢弃，
+    # 避免与当前输入拼成连续两条 user 触发 chat template 异常。
+    while out and out[-1]["role"] != "assistant":
+        out.pop()
 
     if max_chars is None:
         return out

@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from . import config, gpu, store
+from . import config, gpu, prompts, store
 from .embed import EmbeddingProvider
 from .llama import LlamaServer
 from .router import SlotManager, classify, slot_for_tier
@@ -88,21 +88,11 @@ async def process_task(task_id):
         if truncated:
             head = task_limit * 2 // 3
             tail = task_limit - head
-            task_text = (task_text[:head] + "\n...[中间内容已截断]...\n"
+            task_text = (task_text[:head] + prompts.TRUNCATION_MARK
                          + task_text[-tail:])
-        sp = embedding.split(task_text)
-        package = (
-            f"任务：{task_text}\n"
-            f"语义线索：关键词={','.join(sp['keywords'][:6])}；"
-            f"长度={sp['char_len']}字；代码相关={'是' if sp['has_code_hint'] else '否'}\n"
-            "要求：直接给出完整结果，不要寒暄，不要复述任务。"
-            + ("\n注意：原始输入过长，中间部分已截断，请基于保留内容完成。"
-               if truncated else "")
-        )
-        messages = [
-            {"role": "system", "content": "你是本地执行模型，请直接完成任务并输出结果。"},
-            {"role": "user", "content": package},
-        ]
+        # 统一模板：system + user 两条，字段顺序固定，见 app/prompts.py
+        messages = prompts.backend_messages(
+            task_text, embedding.split(task_text), truncated=truncated)
         store.update_task(task_id, progress=50, release_info=f"{slot_key} 正在生成")
         reply = await server.chat(messages, max_tokens=config.MAX_OUTPUT_TOKENS,
                                   temperature=0.3)
@@ -114,12 +104,20 @@ async def process_task(task_id):
         speed = timings.get("predicted_per_second")
         speed_txt = f"，{speed:.1f} tok/s" if isinstance(speed, (int, float)) else ""
         # 结果原样递回；同时写入会话历史，下轮前台能引用这个结果
+        release_text = (f"{slot_key} 执行完成，总耗时 {elapsed}ms"
+                        f"{speed_txt}{degrade_note}"
+                        f"{'；输入已截断' if truncated else ''}")
         store.update_task(task_id, status="completed", progress=100,
                           final_reply=reply, prefill_ms=prefill_ms,
-                          release_info=(f"{slot_key} 执行完成，总耗时 {elapsed}ms"
-                                        f"{speed_txt}{degrade_note}"
-                                        f"{'；输入已截断' if truncated else ''}"))
-        store.append_message(t["session_id"], "assistant", f"[后台结果] {reply}")
+                          release_info=release_text)
+        # 结果已交付；历史补写失败只记录，绝不把 completed 回退成 failed
+        try:
+            store.append_message(t["session_id"], "assistant",
+                                 prompts.history_message(reply))
+        except Exception as exc:
+            store.update_task(
+                task_id,
+                release_info=release_text + f"；历史写入失败: {type(exc).__name__}")
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
         store.update_task(task_id, status="failed", progress=0,
@@ -183,7 +181,7 @@ class ChatRequest(BaseModel):
 
 
 def _base_resp(text, session_id, task_id, tier, mode, instant, reason, status,
-               base_url, queue_position=None, context=None):
+               base_url, queue_position=None, context=None, final_text=None):
     return {
         "code": 200,
         "user_input": text,
@@ -192,7 +190,8 @@ def _base_resp(text, session_id, task_id, tier, mode, instant, reason, status,
         "task_type": tier,
         "process_mode": mode,
         "instant_reply": instant,
-        "最终回复": instant if mode == "direct" else "",
+        # 与 /task_result 的 final_reply 对齐：只放干净结果，不含进度附注
+        "最终回复": final_text if final_text is not None else "",
         "task_status": status,
         "status": "success",
         "num_ctx": config.NUM_CTX,
@@ -226,7 +225,7 @@ async def chat(req: ChatRequest, request: Request):
     slot_key = slot_for_tier(tier)
     needs_backend = slot_key != config.FRONT_KEY
     if slot_key != target_slot:
-        reason += f"；{target_slot} 显存不足，降级到 {slot_key}"
+        reason += f"；{target_slot} 显存不足，已降级到 {slot_key}"
 
     # 队列已满时提前拒绝，不让用户白等一次前台生成
     if needs_backend and queue.full():
@@ -277,7 +276,7 @@ async def chat(req: ChatRequest, request: Request):
         if recent:
             rdesc = "; ".join(
                 f"{t['task_id'][:8]} {t['status']} {t['progress']}%" for t in recent)
-            progress_note = f"\n\n[后台任务进度] {rdesc}"
+            progress_note = prompts.progress_note(rdesc)
 
     messages = [{"role": "system", "content": system}] + history + [
         {"role": "user", "content": text}]
@@ -289,7 +288,7 @@ async def chat(req: ChatRequest, request: Request):
         clean_instant = await front.chat(messages, max_tokens=config.FRONT_MAX_TOKENS,
                                          temperature=0.4)
     except Exception as exc:
-        clean_instant = f"收到，我记下了。（前台模型暂时不可用：{type(exc).__name__}）"
+        clean_instant = prompts.front_failure(exc)
     instant = clean_instant.rstrip() + progress_note if progress_note else clean_instant
 
     # 历史只存干净回复，避免把进度附言带进后续上下文
@@ -304,7 +303,8 @@ async def chat(req: ChatRequest, request: Request):
                           release_info="简单任务由前台槽位直接完成")
         return JSONResponse(_base_resp(text, session_id, task_id, tier,
                                        "direct", instant, reason, "completed",
-                                       base_url, context=context_usage))
+                                       base_url, context=context_usage,
+                                       final_text=clean_instant))
 
     store.create_task(task_id, session_id, text, tier, clean_instant, reason)
     try:
@@ -314,7 +314,8 @@ async def chat(req: ChatRequest, request: Request):
         raise HTTPException(status_code=429, detail="后台队列已满，请稍后重试")
     return JSONResponse(_base_resp(text, session_id, task_id, tier,
                                    "async", instant, reason, "pending",
-                                   base_url, queue_position=queue.qsize(),
+                                   base_url,
+                                   queue_position=max(0, queue.qsize() - 1),
                                    context=context_usage))
 
 
