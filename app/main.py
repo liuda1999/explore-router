@@ -241,9 +241,9 @@ async def chat(req: ChatRequest, request: Request):
         _remaining,
         max(config.HISTORY_MIN_CHARS,
             int(_remaining * config.HISTORY_BUDGET_RATIO)))
-    history = store.get_history(
+    history, history_truncated = store.get_history(
         session_id, max_chars=history_budget,
-        max_messages=config.HISTORY_MAX_MESSAGES)
+        max_messages=config.HISTORY_MAX_MESSAGES, with_meta=True)
     history_chars = sum(len(m["content"]) for m in history)
     context_usage = {
         "num_ctx": config.NUM_CTX,
@@ -251,6 +251,7 @@ async def chat(req: ChatRequest, request: Request):
         "history_chars": history_chars,
         "history_messages": len(history),
         "history_budget_chars": history_budget,
+        "history_truncated": history_truncated,
         "front_max_tokens": config.FRONT_MAX_TOKENS,
         "estimated_total_chars": (len(text) + history_chars
                                   + config.FRONT_MAX_TOKENS
@@ -260,6 +261,8 @@ async def chat(req: ChatRequest, request: Request):
     active = store.active_tasks(session_id)
 
     system = config.FRONT_SYSTEM
+    if history_truncated:
+        system += prompts.HISTORY_TRUNCATED_NOTE
     if active:
         desc = "; ".join(
             f"{a['task_id'][:8]} {a['status']} {a['progress']}%" for a in active)

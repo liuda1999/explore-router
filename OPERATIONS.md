@@ -296,6 +296,12 @@ python3 tests/test_smoke.py        # 基础链路（后端不限 CUDA/ROCm）
 python3 tests/test_slot_switch.py  # 槽位切换 / 上下文恒定
 python3 tests/test_stability.py    # 连续请求，N 从 /health 读
 python3 tests/quick_check.py       # 主路快速检查（约 1 分钟）
+
+# 真机多轮消息传递（三轮不同数据量；结果写 logs/msgtest_round<N>.json）
+python3 tests/msg_rounds_test.py 1   # 小数据量：短对话，全部前台直答
+python3 tests/msg_rounds_test.py 2   # 中等：300-900 字/轮，前台 + 中档 + 重档
+python3 tests/msg_rounds_test.py 3   # 大数据：3000-5000 字/轮，压上下文预算
+
 CTX_MATRIX="8192 16384 32768" ./tests/run_matrix.sh
 
 # 全量真实审计（服务已启动；含 API/并发/长上下文/故障注入/重启恢复）

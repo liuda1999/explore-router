@@ -155,16 +155,24 @@ def append_message(session_id, role, content):
                 (session_id, role, content, time.time()))
 
 
-def get_history(session_id, max_chars=None, max_messages=40):
+def get_history(session_id, max_chars=None, max_messages=40, with_meta=False):
     """取会话历史，按字符预算从最近往前保留完整轮次。
 
     max_chars=None 时返回窗口内全部（最多 max_messages 条）。
     预算不足时宁可少带历史，也不越过调用方分配的上下文预算。
+
+    with_meta=True 时返回 (messages, truncated)。truncated 表示更早的对话
+    因条数或字符预算被丢弃；调用方应提示模型不要猜测被省略的内容。
     """
     with _lock, _db() as c:
+        total_rows = int(c.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id=?", (session_id,)
+        ).fetchone()[0])
         rows = c.execute(
             "SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
             (session_id, max_messages)).fetchall()
+    # 先按条数判断：数据库里还有更早的消息，就说明窗口被截断过
+    truncated = total_rows > len(rows)
     msgs = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
     # 兼容旧数据：合并连续同角色，并丢弃窗口截断后开头的 assistant
@@ -176,16 +184,18 @@ def get_history(session_id, max_chars=None, max_messages=40):
             out.append(dict(m))
     while out and out[0]["role"] != "user":
         out.pop(0)
+        truncated = True
     # 结尾若是孤立的 user（例如上一轮只写入了提问、回复未落库），丢弃，
     # 避免与当前输入拼成连续两条 user 触发 chat template 异常。
     while out and out[-1]["role"] != "assistant":
         out.pop()
+        truncated = True
 
     if max_chars is None:
-        return out
+        return (out, truncated) if with_meta else out
 
     selected = []
-    total = 0
+    total_chars = 0
     i = len(out) - 1
     while i >= 0:
         if (out[i]["role"] == "assistant" and i - 1 >= 0
@@ -196,9 +206,10 @@ def get_history(session_id, max_chars=None, max_messages=40):
             pair = [out[i]]
             i -= 1
         pair_chars = sum(len(m["content"]) for m in pair)
-        if total + pair_chars > max_chars:
+        if total_chars + pair_chars > max_chars:
             # 最近一对都放不下时返回空历史，优先保证不溢出
+            truncated = True
             break
         selected = pair + selected
-        total += pair_chars
-    return selected
+        total_chars += pair_chars
+    return (selected, truncated) if with_meta else selected

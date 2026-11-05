@@ -145,6 +145,7 @@ Every cross-module message is produced by `app/prompts.py`; `PROMPT_VERSION` ide
 | Progress note | `prompts.progress_note()` | `[后台任务进度] ` + real task state | No (instant reply only) |
 | Front degradation | `prompts.front_failure()` | fixed sentence with exception type, no stack trace | Yes (as a clean reply) |
 | Oversized input | `prompts.TRUNCATION_MARK` | keeps first 2/3 and last 1/3, marks the cut | No (task package only) |
+| History truncation | `prompts.HISTORY_TRUNCATED_NOTE` | fixed notice that earlier records are unavailable and must not be replaced or guessed | No (system only) |
 
 Three hard constraints:
 
@@ -342,7 +343,7 @@ Verified: API 27/27, fault injection 10/10, restart recovery 10/10, stability 10
 - **AMD ROCm** is validated at the code and config-parse layers but **not yet on physical AMD hardware**; run the static layer plus a short integration on the target machine before production.
 - **16 GB single-card** was not validated on a real 16 GB card; the "heavy unavailable → automatic degradation" chain was verified on a dual-GPU machine with only one 20 GB card exposed.
 - **`vram_mb` is an estimate** for weights + KV; calibrate it on the target machine. Large errors can misjudge availability.
-- **Early history is not recallable**: turns outside the budget are dropped and the model will explicitly say it has no record. That is the cost of not adding a retrieval layer.
+- **Early history is not recallable, and the model may answer incorrectly**: turns outside the budget are dropped, `context_usage.history_truncated` is set to `true`, and the system prompt states that earlier records are unavailable. Real-machine testing nevertheless showed the lightweight 3B front model can mistake a recent turn for an earlier one and answer confidently. **Do not rely on early recall after truncation**; keep the original record client-side if exact recall matters. This is the cost of not adding a retrieval layer.
 - **No streaming output**; long tasks require polling `/task_result`.
 - **No authentication or rate limiting**; binds to `127.0.0.1` by default. Any external exposure needs a reverse proxy with auth and TLS.
 - **No automatic log/SQLite rotation**; long-running deployments need external logrotate and periodic archiving.
