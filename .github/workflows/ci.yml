@@ -25,9 +25,14 @@ jobs:
     name: GPU 集成审计（self-hosted）
     # 需要一台已部署模型与 pylib 的 GPU 机器，并给 runner 打上 gpu 标签。
     # 该 job 会独占 GPU 启动服务，结束后自动停服；不要与生产实例共用同一组端口。
+    # 默认不让 push 自动排队等 runner：配置好自托管 runner 后，
+    # 把仓库变量 ENABLE_GPU_CI 设为 true 即可启用；手动 workflow_dispatch 总是执行。
     runs-on: [self-hosted, linux, gpu]
     needs: static
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.ENABLE_GPU_CI == 'true' &&
+       github.event_name == 'push' && github.ref == 'refs/heads/main')
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

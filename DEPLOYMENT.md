@@ -397,7 +397,9 @@ tar -czf ~/explore-router-backup.tgz -C <工作区> \
 
 1. 在一台已按本文部署好模型与 `pylib` 的 GPU 机器上安装 self-hosted runner，打上 `gpu` 标签；
 2. 确认该机器不与其他实例共用同一组端口（集成层会用独立端口与数据目录）；
-3. push 到 `main` 或手动 `workflow_dispatch` 触发；`integration` 仅在 `main` push 或手动触发时运行；
+3. 在仓库设置里添加变量 `ENABLE_GPU_CI = true`；之后 push 到 `main` 会自动跑集成层。
+   未配置该变量时，push 只跑 `static`（避免公开仓库里长期挂着一个排队中的 job）；
+   手动 `workflow_dispatch` 无论变量是否设置都会执行集成层；
 4. 期望输出 `STATIC_OK` 与 `INTEGRATION_OK`。
 
 > 静态层不需要 GPU 与模型，**任何机器都能跑**；这也是换设备后建议先跑的第一步。
