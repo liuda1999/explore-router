@@ -33,7 +33,9 @@ htmlcov/
 Thumbs.db
 desktop.ini
 
-# --- 模型权重与大体积二进制资源（由 NAS / 目标机提供，不入库）---
+# --- 模型资产与大体积二进制资源（由 NAS / 目标机提供，不入库）---
+# 整个 models/ 排除：除 GGUF/ONNX 外，tokenizer.json、config.json 等同样不应入库。
+models/
 *.gguf
 *.onnx
 *.safetensors
@@ -52,6 +54,8 @@ desktop.ini
 *.dylib
 
 # --- 运行时产物（日志、数据库、状态、进程文件、测试结果）---
+# 整个 data/ 排除：state.db、state.db-wal / -shm、router.pid 等都不入库。
+data/
 *.log
 logs/
 *.db
