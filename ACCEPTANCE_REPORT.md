@@ -155,3 +155,53 @@ PYTHONPATH=$PWD/pylib:$PWD python3 tests/audit_acceptance.py        # 全量 82 
 PYTHONPATH=$PWD/pylib:$PWD python3 tests/audit_acceptance.py a c    # 只跑指定场景
 # 结果：logs/acceptance_<时间戳>.json（含逐项 check 与日志扫描摘要）
 ```
+
+---
+
+## 10. 复检补充（2026-11-08 19:30–19:45）
+
+> 本节修正 §8 的结论。原结论「本轮未发现代码级缺陷」**不成立**：复检发现了 max_tokens 截断静默的缺陷，已修复并定点验证。
+
+### 10.1 回归断言审计发现的问题
+
+| 位置 | 问题 | 影响 |
+|---|---|---|
+| `test_openai_api.py` | `finish_reason` 从未被断言，服务端也硬编码 `"stop"` | 截断永远无法被测试发现 |
+| `audit_acceptance.py` C 场景 | 只校验 `300 <= len <= 1800`，不查结尾 | 半句截断也能通过 |
+| `audit_acceptance.py` F 场景 | 短输入走前台（`max_tokens=256`），却断言「长度 >= 200」 | 假阳性：实际已被截断仍判通过 |
+| 历史两次 | 比对错了任务的 `final_reply`；假设后台结果一定更长 | 上一轮已修正 |
+
+### 10.2 内容截断实测
+
+- **llama-server 侧**：`truncated = 1` 出现 **0 次**（188 次均为 `truncated = 0`），KV / prompt 未被强制截断。
+- **生成侧**：本次窗口内有 **2 条**前台任务（F 场景「请用大约 400 字…」）在 319 / 306 字处停住，结尾分别是 `…- 硬件` 与 `…（如G` —— 确认撞到 `frontend.max_tokens=256`。
+- **长度分布**（62 个任务）：`>=1200` 字 **0 条**，说明没有任务接近后台 `max_output_tokens=1024` 上限。
+- **污染标记**：`[后台任务失败]`、`...[中间内容已截断]...`、`[后台任务进度]` 在 `final_reply` 中出现 **0 次**。
+- **唯一 <5 字任务**是 `"4。"`（2+2 的答案），不是空产出。
+
+### 10.3 修复：finish_reason 全链路透传
+
+| 文件 | 改动 |
+|---|---|
+| `app/llama.py` | 记录 `last_finish_reason`；`/completion` 兜底按 `stopped_limit` 判 `length` |
+| `app/store.py` | `tasks` 新增 `finish_reason` 列；旧库用 `PRAGMA table_info` + `ALTER TABLE` 自动补列（验证：补列成功、旧数据保留、重复 init 幂等） |
+| `app/main.py` | `/chat`、`/task_result`、`chat/completions`、`responses`、两套 SSE 全部透传；Responses 遇 `length` 返回 `status="incomplete"` + `max_output_tokens`，流式发 `response.incomplete` |
+
+### 10.4 定点验证（真机 6 项，全部符合）
+
+| # | 请求 | 结果 |
+|---|---|---|
+| 1 | `/chat` 长请求（前台 256） | `finish_reason=length`，318 字，`/task_result` 同为 length |
+| 2 | `/chat` 短请求 `2+2` | `finish_reason=stop`，回复 `"2+2等于 **4**！"` |
+| 3 | `/v1/chat/completions` 长请求 | `finish_reason=length`，292 字 |
+| 4 | `/v1/responses` 长请求 | `status=incomplete`，`incomplete_details.reason=max_output_tokens` |
+| 5 | 流式 chat 长请求 | 末帧 `finish_reason=length`，303 字，结尾 `…- **投资机` |
+| 6 | 流式 responses 长请求 | 末事件 `response.incomplete`，305 字，结尾 `…存钱前` |
+
+### 10.5 未完成项（环境阻断）
+
+完整回归套件（`test_openai_api.py` 38 项、`test_responses_api.py` 41 项、`audit_acceptance.py` 约 87 项）**未在修复后的代码上重跑**——执行时 SSH 权限被环境策略拒绝（`~/.ssh` 读取被拒），无法继续操作远程设备。
+
+已完成的替代验证：本地 `compileall` + `ci_static.sh` → `STATIC_OK`（9 份文档、32 文件可移植性）；上述 6 项真机定点验证。
+
+**遗留动作**：恢复设备访问后需补跑三套回归，并确认远程服务已停止（当前因无法登录，服务可能仍在运行）。
