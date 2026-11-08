@@ -172,7 +172,7 @@ async def lifespan(app):
     await front.stop()
 
 
-app = FastAPI(title="explore 智能本地路由", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title="explore 智能本地路由", version="2.4.0", lifespan=lifespan)
 STARTED_AT = int(time.time())
 
 

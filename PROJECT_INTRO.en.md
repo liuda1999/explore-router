@@ -1,6 +1,6 @@
 # explore · Intelligent Local LLM Router — Project Introduction
 
-> **Version** v2.3.0 ｜ **Updated** 2026-11-08 ｜ **Configuration-driven edition**
+> **Version** v2.4.0 ｜ **Updated** 2026-11-08 ｜ **Configuration-driven edition**
 > Workspace: `<deployment directory>` (scripts resolve paths from their own location; nothing is hard-coded)
 > Bilingual entry point: [README.md](README.md) ｜ 中文版: [PROJECT_INTRO.md](PROJECT_INTRO.md)
 
@@ -106,6 +106,8 @@ flowchart TD
 | `app/store.py` | SQLite `messages` / `tasks`; merge consecutive same-role messages, budget-truncate and normalise history, task state machine, restart recovery | Cross-session retrieval |
 | `app/router.py` | Classification, `tier_to_slot` mapping, static `VRAM_PLAN` selection/degradation, mutually-exclusive `ensure()` | Assumption that exactly three slots exist |
 | `app/prompts.py` | **Central message templates**: backend system, task package, result/progress prefixes, truncation marker, degradation text; `PROMPT_VERSION` identifies the revision | No routing decisions, no config access |
+| `app/compaction.py` | **Context compaction**: summariser persona, rolling-merge template, content-hash cache key, summary prefix | Does not decide the budget, does not write the database |
+| `app/openai_api.py` | **OpenAI protocol translation**: chat/completions and Responses request parsing, response/SSE frames, model list, error bodies | No access to model processes or the database |
 | `app/main.py` | FastAPI endpoints, instant reply, progress attachment, enqueue, worker, verbatim result, `context_usage`, error codes | Hardware logic beyond resolved config |
 | `run.sh` | Idempotent start/stop, workspace resolved from script location, ports from config, pre-start VRAM check | Hard-coded paths, global `pkill` |
 
@@ -364,12 +366,12 @@ Precedence: `explore_mode` > `X-Explore-Mode` > model suffix > `openai.default_m
 | Static (any machine, no GPU) | Python/Shell syntax, config parsing and fail-fast, portability (no device/model hard-coding), documentation consistency, ruff | `bash tests/ci_static.sh` |
 | GPU integration (self-hosted runner) | Basic chain, slot switching, stability, context matrix, long-context recall, fault injection, restart recovery, single-card thresholds | `bash tests/ci_integration.sh` |
 | OpenAI compatibility | 38 checks for chat/completions, 41 for Responses (including `finish_reason` truncation visibility and `previous_response_id` continuation) | `python3 tests/test_openai_api.py` / `tests/test_responses_api.py` |
-| Pre-release acceptance | Long-context turns, Responses continuation, repeated long outputs, three-protocol consistency, concurrency, both SSE variants, error paths, log scan | `python3 tests/audit_acceptance.py` |
+| Pre-release acceptance | Long-context turns (including compaction trigger and first-turn recall), Responses continuation, repeated long outputs, three-protocol consistency, concurrency, both SSE variants, error paths, log scan | `python3 tests/audit_acceptance.py` |
 | Full audit | API contract, concurrency, content correctness, real SIGKILL, real restart | `BASE=http://127.0.0.1:8100 ./tests/audit_runner.sh` |
 
 GitHub Actions is defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml): `static` runs on `ubuntu-latest`; `integration` runs on a self-hosted runner tagged `gpu`, with dedicated ports and data directory, stopping the service afterwards and never sharing ports with a production instance. Set the repository variable `ENABLE_GPU_CI` to `true` to have pushes to `main` trigger it automatically (otherwise a public repository would show a permanently queued job); a manual `workflow_dispatch` always runs it. See [DEPLOYMENT.md](DEPLOYMENT.md) §9.
 
-Verified: API 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long context 15/15 per tier, 32K/64K/96K matrix 69/69, OpenAI compatibility 38/38 + 41/41, pre-release acceptance 91/91, single-card degradation chain, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md) and [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md).
+Verified: API 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long context 15/15 per tier, 32K/64K/96K matrix 69/69, OpenAI compatibility 38/38 + 41/41, pre-release acceptance 93/93 (including context compaction, first-turn codename recall and a real `moe` slot run), single-card degradation chain, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md) and [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md).
 
 ---
 

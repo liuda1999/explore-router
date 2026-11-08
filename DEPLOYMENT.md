@@ -2,7 +2,7 @@
 
 > **English summary**: A complete, device-agnostic deployment runbook — prerequisites, the exact startup sequence, three hardware scenarios (multi-GPU NVIDIA / single AMD / small-VRAM single card), environment overrides, a first-boot acceptance checklist, regression commands, failure triage, upgrade/rollback, and CI wiring. Short version in [README.md](README.md); component rationale in [TECH_STACK.md](TECH_STACK.md).
 >
-> **版本** v2.3.0 ｜ **更新** 2026-11-08
+> **版本** v2.4.0 ｜ **更新** 2026-11-08
 > **核心原则**：不写死路径、不装系统服务、不设开机自启、不污染系统 Python 环境。
 
 ---
@@ -218,7 +218,8 @@ curl -s -X POST http://127.0.0.1:8100/v1/responses \
 | 8 | 进度提问 | 返回 `[后台任务进度]` 真实状态 |
 | 9 | `/chat` 的 `context_usage` | `estimated_total_chars <= num_ctx` |
 | 10 | `/v1/models`、`/v1/chat/completions`、`/v1/responses` | 返回 `explore` 等虚拟模型名；`object=chat.completion` / `response`，正文非空，`explore.task_id` 可查 |
-| 11 | 停止后 | `./run.sh status` 显示 not running；本项目端口释放 |
+| 11 | 长对话的 `context_usage` | 超出预算时为 `history_truncated=true`；开启压缩时 `context_compressed=true` 且 `summary_chars>0`（摘要见 `data/state.db` 的 `session_summaries`） |
+| 12 | 停止后 | `./run.sh status` 显示 not running；本项目端口释放 |
 
 ### Step 8 · 回归测试
 
@@ -359,6 +360,7 @@ CTX_MATRIX="32768" ./tests/run_matrix.sh
 | `embedding.dim=0` | ONNX 路径/参数问题 | 看 `/health` 的 `embedding.error`，核对 `embedding.*` |
 | 后台结果为空 | thinking 模型把正文写进 `reasoning_content` | 调用层已做 `enable_thinking=false` + `/completion` 兜底，勿删 |
 | 大上下文 OOM | 前台 KV 挤占显存 | 调 `context.kv_cache`、`auto_table`、`placement`；不要改代码 |
+| `/config` 某槽位 `available=false` | 该槽位估算装不下（看 `vram_plan.<slot>.reason`） | 先看 `reason` 里的 `need / usable`；多卡时**不要写死 `split_ratio`**，删除后由「空闲显存 − 前台占用」自动计算；仍不够再校准 `vram_mb` |
 | uvicorn 报 `ServerProtocol` | 系统 `websockets` 太旧 | 按 `requirements.txt` 把 `websockets` 装进 `pylib` |
 | `NOT READY; see logs/api.log` | `--wait` 超时 | 看日志与 `startup_timeout_s`；大模型冷启动可调大超时 |
 | 切换上下文档位不生效 | 未重启 | `num_ctx` 是启动期常量，必须 stop + start |

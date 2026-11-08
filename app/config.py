@@ -200,7 +200,7 @@ COMPACTION_ENABLED = str(_env(
     "COMPACTION_ENABLED", _comp.get("enabled", True))).lower() not in (
     "0", "false", "no", "off")
 COMPACTION_MAX_SUMMARY_CHARS = max(80, int(_env(
-    "COMPACTION_MAX_SUMMARY_CHARS", _comp.get("max_summary_chars", 400))))
+    "COMPACTION_MAX_SUMMARY_CHARS", _comp.get("max_summary_chars", 800))))
 COMPACTION_MIN_DROPPED_CHARS = max(0, int(_env(
     "COMPACTION_MIN_DROPPED_CHARS", _comp.get("min_dropped_chars", 600))))
 

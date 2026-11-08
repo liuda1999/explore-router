@@ -1,6 +1,6 @@
 # explore 智能本地路由 — 项目介绍
 
-> **版本** v2.3.0 ｜ **更新** 2026-11-08 ｜ **配置驱动版**
+> **版本** v2.4.0 ｜ **更新** 2026-11-08 ｜ **配置驱动版**
 > 工作区：`<部署目录>`（脚本按自身位置定位，不写死路径）
 > 双语入口：[README.md](README.md) ｜ English edition: [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md)
 
@@ -106,6 +106,8 @@ flowchart TD
 | `app/store.py` | SQLite `messages` / `tasks`；合并连续同角色消息、按预算截断并规范化历史、任务状态机、重启恢复 | 无跨会话检索层 |
 | `app/router.py` | 分级、`tier_to_slot` 映射、静态 `VRAM_PLAN` 选槽/降级、后台槽位互斥 `ensure()` | 不假设恰好三个槽位 |
 | `app/prompts.py` | **统一消息模板**：后台 system、任务包、结果/进度前缀、截断标记、降级文案；`PROMPT_VERSION` 标识版本 | 不参与路由决策，不读配置 |
+| `app/compaction.py` | **上下文压缩**：摘要器人格、滚动合并模板、内容哈希缓存键、摘要注入前缀 | 不决定裁剪预算，不写数据库 |
+| `app/openai_api.py` | **OpenAI 协议转换**：chat/completions 与 Responses 的请求解析、响应/SSE 帧、模型列表、错误体 | 不接触模型进程与数据库 |
 | `app/main.py` | FastAPI 接口、即时回复、进度附注、任务入队、worker、结果原样写回、`context_usage`、错误码 | 不含业务逻辑以外的硬件逻辑 |
 | `run.sh` | 幂等启停，按脚本位置定位工作区，端口从配置读取，启动前显存预检 | 不写死路径、不做全局 `pkill` |
 
@@ -364,12 +366,12 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 | 静态层（任意机器，无需 GPU） | Python/Shell 语法、配置解析与 fail-fast、可移植性（无设备/模型硬编码）、文档一致性、ruff | `bash tests/ci_static.sh` |
 | GPU 集成层（自托管 GPU runner） | 基础链路、槽位切换、稳定性、上下文矩阵、长上下文召回、故障注入、重启恢复、单卡阈值 | `bash tests/ci_integration.sh` |
 | OpenAI 兼容层 | chat/completions 38 项、Responses 41 项（含 `finish_reason` 截断可见性、`previous_response_id` 续接） | `python3 tests/test_openai_api.py` / `tests/test_responses_api.py` |
-| 发布前验收压测 | 长上下文多轮、Responses 续接、连续长文本、三协议一致性、并发队列、两套 SSE、边界错误、日志扫描 | `python3 tests/audit_acceptance.py` |
+| 发布前验收压测 | 长上下文多轮（含压缩触发与首轮召回）、Responses 续接、连续长文本、三协议一致性、并发队列、两套 SSE、边界错误、日志扫描 | `python3 tests/audit_acceptance.py` |
 | 全量审计 | API 契约、并发、内容正确性、真实 SIGKILL、真实重启 | `BASE=http://127.0.0.1:8100 ./tests/audit_runner.sh` |
 
 GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：`static` 跑在 `ubuntu-latest`；`integration` 跑在带 `gpu` 标签的 self-hosted runner，使用独立端口与数据目录，结束自动停服，不与生产实例共用端口。把仓库变量 `ENABLE_GPU_CI` 设为 `true` 后，push 到 `main` 才会自动触发集成层（避免公开仓库里长期挂一个排队中的 job）；手动 `workflow_dispatch` 总是执行，详见 [DEPLOYMENT.md](DEPLOYMENT.md) 第 9 节。
 
-已实测通过：API 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 38/38 + 41/41、发布前验收压测 91/91、单卡（20G）降级链路、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。
+已实测通过：API 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 38/38 + 41/41、发布前验收压测 93/93（含上下文压缩、首轮暗号召回与 moe 槽位实测）、单卡（20G）降级链路、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。
 
 ---
 

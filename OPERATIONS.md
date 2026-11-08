@@ -1,6 +1,6 @@
 # explore 智能本地路由 — 运维手册
 
-> 配置驱动版 v2.3.0 / 2026-11-08 / 工作区：`<部署目录>`（脚本按自身位置定位，不写死绝对路径）
+> 配置驱动版 v2.4.0 / 2026-11-08 / 工作区：`<部署目录>`（脚本按自身位置定位，不写死绝对路径）
 
 ## 文档导航
 
@@ -46,6 +46,8 @@ explore-router/
 │   ├── store.py           SQLite 任务状态与会话历史
 │   ├── router.py          分级 + 互斥槽位（按 key 操作）
 │   ├── prompts.py         统一消息模板（任务包 / 前缀 / 降级文案）
+│   ├── compaction.py      上下文压缩（滚动摘要模板与缓存键）
+│   ├── openai_api.py      OpenAI 协议转换（chat/completions + Responses）
 │   └── main.py            FastAPI 接口
 ├── models/                GGUF 与 embedding（路径在 settings.yaml 中写）
 ├── pylib/                 Python 依赖
@@ -93,6 +95,9 @@ curl -s http://127.0.0.1:8100/config    # ★ 确认解析出的后端、卡数�
 | `context.num_ctx` | `auto` 或整数 | `auto` 按显存查 `auto_table` |
 | `context.auto_table` | 总显存 → 默认 N 的启发式表 | **最低 32K**；更大上下文需实测后加表项或用 `NUM_CTX` 覆盖 |
 | `context.kv_cache` | KV 精度（如 `q8_0`） | 只影响显存，不改变 `num_ctx` |
+| `context.compaction.enabled` | 是否开启历史压缩（默认 `true`） | 关闭后退回「丢弃 + `history_truncated`」旧行为 |
+| `context.compaction.max_summary_chars` | 摘要长度上限（默认 800 字） | **太小会挤掉早期暗号**；实测 400 不足，800 可保留 5 个标记 |
+| `context.compaction.min_dropped_chars` | 被丢弃内容少于该值时不摘要（默认 600） | 小段丢弃直接丢，省一次前台调用 |
 | `embedding.onnx` / `tokenizer` | 嵌入模型路径 | 换嵌入模型 |
 | `budget.reserve_system_mb` | 系统/驱动预留显存，按可见卡数分摊 | 小显存设备可调小，但不建议为 0 |
 | `budget.headroom_ratio` | 显存安全余量（默认 0.10） | 装不下时宁可标记不可用，也不 OOM |

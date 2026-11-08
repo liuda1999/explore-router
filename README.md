@@ -32,9 +32,9 @@ The original constraint was a single 16 GB GPU that could not hold several large
 | **Mutually-exclusive backend** | At most one backend model is resident. It may stay loaded; it is only replaced when a different tier is requested. |
 | **Constant context window** | `num_ctx` is resolved once at startup and applied to every instance. Switching models never changes it. Minimum supported is **32K**. |
 | **Verbatim result delivery** | Backend output is written to `final_reply` unchanged — the front model does not rewrite or summarise it. |
-| **OpenAI-compatible** | `/v1/chat/completions` + `/v1/models` work with Cherry Studio / Open WebUI / Dify: `final` mode waits for the backend, `instant` mode returns the front reply plus a `task_id`. |
+| **OpenAI-compatible** | `/v1/chat/completions`, `/v1/responses` and `/v1/models` work with Cherry Studio / Open WebUI / Dify: `final` mode waits for the backend, `instant` mode returns the front reply plus a `task_id`. |
 | **Observable progress** | Asking "how is it going" attaches the real task state from SQLite, not a generated guess. |
-| **Automatic VRAM guard** | `vram_plan` evaluates visible GPUs at startup. A slot that does not fit is marked `available: false`; heavy requests degrade to `default_slot` instead of OOM-ing. |
+| **Automatic VRAM guard** | `vram_plan` evaluates visible GPUs at startup. A slot that does not fit is marked `available: false`; heavy requests degrade to `default_slot` instead of OOM-ing. Multi-GPU layer split is derived from free VRAM at startup — no hard-coded ratio. |
 | **Automatic context budget** | History budget scales with `num_ctx` and shrinks when the current input is long. Long chains stay stable and recall stays accurate. |
 | **Compress before dropping** | When history exceeds the budget, early turns are rolling-summarised (preserving codenames verbatim) instead of being discarded; `context_usage.context_compressed` makes it observable. |
 | **Portable** | No absolute device paths, no GPU indices, no model file names inside `app/`, `run.sh`, `tests/` or `.github/`. |
@@ -159,7 +159,7 @@ Stop cleanly (only this project's PID and configured ports are touched):
 
 ### Verified status
 
-Audited on real hardware with real models, real process crashes and real restarts — **no mocks**: API contract 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long-context 15/15 per context tier, 32K/64K/96K matrix 69/69, OpenAI compatibility **38/38** (chat/completions) and **41/41** (Responses), pre-release acceptance **91/91**, single-GPU degradation verified, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md) and [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md). All performance figures there are **device-specific historical measurements**, not project limits.
+Audited on real hardware with real models, real process crashes and real restarts — **no mocks**: API contract 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long-context 15/15 per context tier, 32K/64K/96K matrix 69/69, OpenAI compatibility **38/38** (chat/completions) and **41/41** (Responses), pre-release acceptance **93/93** (including compaction and early recall), single-GPU degradation verified, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md) and [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md). All performance figures there are **device-specific historical measurements**, not project limits.
 
 ### Documentation
 
@@ -211,9 +211,9 @@ You may use, modify and redistribute this project, including commercially, provi
 | **后台互斥槽位** | 最多一个后台模型驻留；允许一直常驻，只在需要另一档时才换掉。 |
 | **上下文恒定** | `num_ctx` 启动时解析一次并应用到所有实例，切换模型不改变它；最低支持 **32K**。 |
 | **结果原样递回** | 后台输出直接写入 `final_reply`，前台不改写、不整理。 |
-| **OpenAI 兼容** | `/v1/chat/completions` + `/v1/models` 可直接接入 Cherry Studio / Open WebUI / Dify：`final` 模式等后台完成，`instant` 模式立即回即时回复并给 `task_id`。 |
+| **OpenAI 兼容** | `/v1/chat/completions`、`/v1/responses`、`/v1/models` 可直接接入 Cherry Studio / Open WebUI / Dify：`final` 模式等后台完成，`instant` 模式立即回即时回复并给 `task_id`。 |
 | **进度可观测** | 用户问进度时附加来自 SQLite 的真实任务状态，而不是模型编造。 |
-| **显存自动阈值** | `vram_plan` 按启动期可见 GPU 判断；装不下的槽位标 `available: false`，heavy 自动降级到 `default_slot`，不强行加载导致 OOM。 |
+| **显存自动阈值** | `vram_plan` 按启动期可见 GPU 判断；装不下的槽位标 `available: false`，heavy 自动降级到 `default_slot`，不强行加载导致 OOM。多卡分层比例按启动期空闲显存自动推导，不写死。 |
 | **上下文自动预算** | 历史预算随 `num_ctx` 伸缩，当前输入变长时自动收紧，保证长链路稳定与召回准确。 |
 | **先压缩再丢弃** | 历史超预算时，把早期轮次滚动摘要保留（暗号逐字保留），而不是直接丢弃；`context_usage.context_compressed` 可观测。 |
 | **可移植** | `app/`、`run.sh`、`tests/`、`.github/` 内无设备绝对路径、无显卡索引、无模型文件名硬编码。 |
@@ -337,7 +337,7 @@ curl -s -X POST http://127.0.0.1:8100/v1/responses \
 
 ### 验证状态
 
-真机、真模型、真实进程故障与真实重启审计，**全程不使用 mock**：API 契约 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 **38/38**（chat/completions）与 **41/41**（Responses）、发布前验收压测 **91/91**、单卡降级已验证、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。其中所有性能数字都是**特定设备的历史实测**，不是项目约束或能力边界。
+真机、真模型、真实进程故障与真实重启审计，**全程不使用 mock**：API 契约 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 **38/38**（chat/completions）与 **41/41**（Responses）、发布前验收压测 **93/93**（含上下文压缩与早期召回）、单卡降级已验证、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。其中所有性能数字都是**特定设备的历史实测**，不是项目约束或能力边界。
 
 ### 文档索引
 

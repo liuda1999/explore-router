@@ -2,7 +2,7 @@
 
 > **English summary**: This document explains the full technology stack of `explore`, why each component was chosen, what the pinned versions are, how the layers interact, and what the compatibility matrix looks like. For the short version see [README.md](README.md); for installation see [DEPLOYMENT.md](DEPLOYMENT.md).
 >
-> **版本** v2.3.0 ｜ **更新** 2026-11-08 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
+> **版本** v2.4.0 ｜ **更新** 2026-11-08 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
 
 ---
 
@@ -59,6 +59,10 @@ flowchart TB
 **依赖方向是单向的**：执行层不知道决策层的存在，决策层不知道具体设备型号，配置层是唯一把「这台机器长什么样」翻译给其它层的桥梁。
 
 `app/prompts.py` 是独立的**消息模板层**：后台 system、任务包、结果/进度前缀、截断标记、降级文案全部集中定义，带 `PROMPT_VERSION` 版本标记。业务代码不再内联拼接跨模块文本，改模板只改这一个文件。
+
+`app/compaction.py` 是**上下文压缩层**：只负责「把将被裁掉的早期轮次压成一段摘要」的提示词与缓存键，裁剪预算仍由 `config.py` 计算、历史读写仍由 `store.py` 负责。它复用前台常驻模型完成摘要，**不额外加载模型、不触发槽位切换**；摘要结果按内容哈希缓存在 SQLite 的 `session_summaries` 表，同一段内容只压一次。
+
+`app/openai_api.py` 是**协议转换层**：只做 OpenAI 两套协议与内部请求/响应之间的结构映射，不接触模型进程与数据库，因此两条入口（`/chat` 与 `/v1/*`）共用同一套编排逻辑，行为不会漂移。
 
 ---
 
