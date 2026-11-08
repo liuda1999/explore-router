@@ -32,6 +32,7 @@ The original constraint was a single 16 GB GPU that could not hold several large
 | **Mutually-exclusive backend** | At most one backend model is resident. It may stay loaded; it is only replaced when a different tier is requested. |
 | **Constant context window** | `num_ctx` is resolved once at startup and applied to every instance. Switching models never changes it. Minimum supported is **32K**. |
 | **Verbatim result delivery** | Backend output is written to `final_reply` unchanged — the front model does not rewrite or summarise it. |
+| **OpenAI-compatible** | `/v1/chat/completions` + `/v1/models` work with Cherry Studio / Open WebUI / Dify: `final` mode waits for the backend, `instant` mode returns the front reply plus a `task_id`. |
 | **Observable progress** | Asking "how is it going" attaches the real task state from SQLite, not a generated guess. |
 | **Automatic VRAM guard** | `vram_plan` evaluates visible GPUs at startup. A slot that does not fit is marked `available: false`; heavy requests degrade to `default_slot` instead of OOM-ing. |
 | **Automatic context budget** | History budget scales with `num_ctx` and shrinks when the current input is long. Long chains stay stable and recall stays accurate. |
@@ -116,6 +117,27 @@ curl -s -X POST http://127.0.0.1:8100/chat \
 curl -s 'http://127.0.0.1:8100/task_result?task_id=<id>'
 ```
 
+OpenAI-compatible clients (Cherry Studio, Open WebUI, Dify, ...) can point at the same router:
+
+```bash
+curl -s http://127.0.0.1:8100/v1/models
+
+# default: wait for the backend task, return the complete result
+curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","messages":[{"role":"user","content":"What is 2+2?"}]}'
+
+# instant mode: return the front-model reply immediately and expose task_id
+curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore-fast","messages":[{"role":"user","content":"Analyze and design a complete solution"}]}'
+
+# streaming: chunked SSE, not token-by-token
+curl -sN -X POST http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
 Stop cleanly (only this project's PID and configured ports are touched):
 
 ```bash
@@ -145,7 +167,7 @@ Audited on real hardware with real models, real process crashes and real restart
 
 ### Current boundaries
 
-No authentication, no streaming output, no rate limiting, no automatic log/database rotation — the API binds to `127.0.0.1` and expects a reverse proxy with auth if exposed. AMD ROCm is validated at the config/parse layer but not yet on physical AMD hardware. Details in [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md), section "Known limitations".
+No authentication, no rate limiting, no automatic log/database rotation — the API binds to `127.0.0.1` and expects a reverse proxy with auth if exposed. SSE is chunked rather than token-by-token, because the upstream `llama-server` call is non-streaming. AMD ROCm is validated at the config/parse layer but not yet on physical AMD hardware. Details in [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md), section "Known limitations".
 
 ### License
 
@@ -177,6 +199,7 @@ You may use, modify and redistribute this project, including commercially, provi
 | **后台互斥槽位** | 最多一个后台模型驻留；允许一直常驻，只在需要另一档时才换掉。 |
 | **上下文恒定** | `num_ctx` 启动时解析一次并应用到所有实例，切换模型不改变它；最低支持 **32K**。 |
 | **结果原样递回** | 后台输出直接写入 `final_reply`，前台不改写、不整理。 |
+| **OpenAI 兼容** | `/v1/chat/completions` + `/v1/models` 可直接接入 Cherry Studio / Open WebUI / Dify：`final` 模式等后台完成，`instant` 模式立即回即时回复并给 `task_id`。 |
 | **进度可观测** | 用户问进度时附加来自 SQLite 的真实任务状态，而不是模型编造。 |
 | **显存自动阈值** | `vram_plan` 按启动期可见 GPU 判断；装不下的槽位标 `available: false`，heavy 自动降级到 `default_slot`，不强行加载导致 OOM。 |
 | **上下文自动预算** | 历史预算随 `num_ctx` 伸缩，当前输入变长时自动收紧，保证长链路稳定与召回准确。 |
@@ -260,6 +283,27 @@ curl -s -X POST http://127.0.0.1:8100/chat \
 curl -s 'http://127.0.0.1:8100/task_result?task_id=<id>'
 ```
 
+OpenAI 兼容客户端（Cherry Studio、Open WebUI、Dify 等）可直接指向同一个路由：
+
+```bash
+curl -s http://127.0.0.1:8100/v1/models
+
+# 默认：等后台任务完成，返回完整结果
+curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","messages":[{"role":"user","content":"2+2 等于几"}]}'
+
+# instant：立即返回前台即时回复，并给出 task_id
+curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore-fast","messages":[{"role":"user","content":"请详细分析并给出完整方案"}]}'
+
+# 流式：分块 SSE，不是逐 token
+curl -sN -X POST http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+```
+
 停止（只处理本项目 PID 与配置中的端口，不做全局清理）：
 
 ```bash
@@ -289,7 +333,7 @@ curl -s 'http://127.0.0.1:8100/task_result?task_id=<id>'
 
 ### 当前边界
 
-无鉴权、无流式输出、无速率限制、无日志/数据库自动轮转——默认绑定 `127.0.0.1`，对外暴露必须加反向代理与鉴权。AMD ROCm 已完成代码与配置解析层验证，尚未在 AMD 真机上实测。详见 [PROJECT_INTRO.md](PROJECT_INTRO.md)「已知限制」。
+无鉴权、无速率限制、无日志/数据库自动轮转——默认绑定 `127.0.0.1`，对外暴露必须加反向代理与鉴权。SSE 为分块发送而非逐 token 流式（底层 `llama-server` 调用非流式）。AMD ROCm 已完成代码与配置解析层验证，尚未在 AMD 真机上实测。详见 [PROJECT_INTRO.md](PROJECT_INTRO.md)「已知限制」。
 
 ### 许可证
 

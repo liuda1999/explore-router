@@ -155,33 +155,26 @@ def append_message(session_id, role, content):
                 (session_id, role, content, time.time()))
 
 
-def get_history(session_id, max_chars=None, max_messages=40, with_meta=False):
-    """取会话历史，按字符预算从最近往前保留完整轮次。
+def trim_history(msgs, max_chars=None):
+    """对任意消息列表做角色规范化与预算裁剪（纯函数，不读库）。
 
-    max_chars=None 时返回窗口内全部（最多 max_messages 条）。
-    预算不足时宁可少带历史，也不越过调用方分配的上下文预算。
+    规则与 get_history 完全一致：合并连续同角色、丢弃开头的非 user 与
+    结尾的非 assistant、按字符预算从最近往前保留完整轮次。
+    OpenAI 兼容层自带 messages，用它复用同一套预算逻辑，避免两套实现漂移。
 
-    with_meta=True 时返回 (messages, truncated)。truncated 表示更早的对话
-    因条数或字符预算被丢弃；调用方应提示模型不要猜测被省略的内容。
+    返回 (messages, truncated)。
     """
-    with _lock, _db() as c:
-        total_rows = int(c.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id=?", (session_id,)
-        ).fetchone()[0])
-        rows = c.execute(
-            "SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
-            (session_id, max_messages)).fetchall()
-    # 先按条数判断：数据库里还有更早的消息，就说明窗口被截断过
-    truncated = total_rows > len(rows)
-    msgs = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
-
-    # 兼容旧数据：合并连续同角色，并丢弃窗口截断后开头的 assistant
     out = []
+    truncated = False
     for m in msgs:
-        if out and out[-1]["role"] == m["role"]:
-            out[-1]["content"] = out[-1]["content"] + "\n\n" + m["content"]
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = m.get("content") or ""
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] = out[-1]["content"] + "\n\n" + content
         else:
-            out.append(dict(m))
+            out.append({"role": role, "content": content})
     while out and out[0]["role"] != "user":
         out.pop(0)
         truncated = True
@@ -192,7 +185,7 @@ def get_history(session_id, max_chars=None, max_messages=40, with_meta=False):
         truncated = True
 
     if max_chars is None:
-        return (out, truncated) if with_meta else out
+        return out, truncated
 
     selected = []
     total_chars = 0
@@ -212,4 +205,27 @@ def get_history(session_id, max_chars=None, max_messages=40, with_meta=False):
             break
         selected = pair + selected
         total_chars += pair_chars
-    return (selected, truncated) if with_meta else selected
+    return selected, truncated
+
+
+def get_history(session_id, max_chars=None, max_messages=40, with_meta=False):
+    """取会话历史，按字符预算从最近往前保留完整轮次。
+
+    max_chars=None 时返回窗口内全部（最多 max_messages 条）。
+    预算不足时宁可少带历史，也不越过调用方分配的上下文预算。
+
+    with_meta=True 时返回 (messages, truncated)。truncated 表示更早的对话
+    因条数或字符预算被丢弃；调用方应提示模型不要猜测被省略的内容。
+    """
+    with _lock, _db() as c:
+        total_rows = int(c.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id=?", (session_id,)
+        ).fetchone()[0])
+        rows = c.execute(
+            "SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, max_messages)).fetchall()
+    truncated = total_rows > len(rows)
+    msgs = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    out, cut = trim_history(msgs, max_chars=max_chars)
+    truncated = truncated or cut
+    return (out, truncated) if with_meta else out

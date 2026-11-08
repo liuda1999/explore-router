@@ -1,6 +1,6 @@
 # explore 智能本地路由 — 运维手册
 
-> 配置驱动版 v2.2.1 / 2026-11-06 / 工作区：`<部署目录>`（脚本按自身位置定位，不写死绝对路径）
+> 配置驱动版 v2.3.0 / 2026-11-08 / 工作区：`<部署目录>`（脚本按自身位置定位，不写死绝对路径）
 
 ## 文档导航
 
@@ -296,6 +296,7 @@ python3 tests/test_smoke.py        # 基础链路（后端不限 CUDA/ROCm）
 python3 tests/test_slot_switch.py  # 槽位切换 / 上下文恒定
 python3 tests/test_stability.py    # 连续请求，N 从 /health 读
 python3 tests/quick_check.py       # 主路快速检查（约 1 分钟）
+python3 tests/test_openai_api.py   # OpenAI 兼容层：models / direct / instant / 超时 / 流式
 
 # 真机多轮消息传递（三轮不同数据量；结果写 logs/msgtest_round<N>.json）
 python3 tests/msg_rounds_test.py 1   # 小数据量：短对话，全部前台直答

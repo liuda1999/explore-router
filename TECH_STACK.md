@@ -2,7 +2,7 @@
 
 > **English summary**: This document explains the full technology stack of `explore`, why each component was chosen, what the pinned versions are, how the layers interact, and what the compatibility matrix looks like. For the short version see [README.md](README.md); for installation see [DEPLOYMENT.md](DEPLOYMENT.md).
 >
-> **版本** v2.2.1 ｜ **更新** 2026-11-06 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
+> **版本** v2.3.0 ｜ **更新** 2026-11-08 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
 
 ---
 

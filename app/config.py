@@ -52,6 +52,16 @@ N_GPU_LAYERS = int(_env("N_GPU_LAYERS", _runtime.get("n_gpu_layers", 99)))
 MAX_OUTPUT_TOKENS = int(_env("MAX_OUTPUT_TOKENS", _runtime.get("max_output_tokens", 1024)))
 QUEUE_MAXSIZE = int(_env("QUEUE_MAXSIZE", _runtime.get("queue_maxsize", 32)))
 
+# OpenAI 兼容层：非流式请求默认等待后台完成；超时后回退即时回复并给出 task_id。
+# 负数按 0 处理（0 = 不等，立即返回即时回复）。
+_openai = _S.get("openai", {}) or {}
+OPENAI_WAIT_TIMEOUT_S = max(0, int(_env(
+    "OPENAI_WAIT_TIMEOUT_S", _openai.get("wait_timeout_s", 120))))
+OPENAI_DEFAULT_MODE = str(
+    _env("OPENAI_DEFAULT_MODE", _openai.get("default_mode", "final"))).lower()
+if OPENAI_DEFAULT_MODE not in ("final", "instant"):
+    OPENAI_DEFAULT_MODE = "final"
+
 # 硬件探测：不写死卡数 / 品牌 / 后端
 GPU_BACKEND_PREF = str(_env("GPU_BACKEND", _runtime.get("gpu_backend", "auto"))).lower()
 SNAP = gpu.snapshot(GPU_BACKEND_PREF)
@@ -363,6 +373,10 @@ def describe():
             "context_safety_tokens": CONTEXT_SAFETY_TOKENS,
         },
         "paths": {"data": str(DATA), "logs": str(LOGS)},
+        "openai": {
+            "default_mode": OPENAI_DEFAULT_MODE,
+            "wait_timeout_s": OPENAI_WAIT_TIMEOUT_S,
+        },
         "vram_plan": VRAM_PLAN,
         "slots": {
             k: {

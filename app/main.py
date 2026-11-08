@@ -12,10 +12,10 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import config, gpu, prompts, store
+from . import config, gpu, openai_api, prompts, store
 from .embed import EmbeddingProvider
 from .llama import LlamaServer
 from .router import SlotManager, classify, slot_for_tier
@@ -171,7 +171,8 @@ async def lifespan(app):
     await front.stop()
 
 
-app = FastAPI(title="explore 智能本地路由", version="2.2.1", lifespan=lifespan)
+app = FastAPI(title="explore 智能本地路由", version="2.3.0", lifespan=lifespan)
+STARTED_AT = int(time.time())
 
 
 class ChatRequest(BaseModel):
@@ -204,27 +205,45 @@ def _base_resp(text, session_id, task_id, tier, mode, instant, reason, status,
     }
 
 
-@app.post("/chat")
-async def chat(req: ChatRequest, request: Request):
-    text = (req.user_input or "").strip()
+async def _wait_task(task_id, timeout_s):
+    """轮询后台任务直到完成/失败或超时；返回 (task, timed_out)。"""
+    deadline = time.time() + max(0.0, float(timeout_s))
+    while time.time() < deadline:
+        task = store.get_task(task_id)
+        if task and task["status"] in ("completed", "failed"):
+            return task, False
+        await asyncio.sleep(0.2)
+    return store.get_task(task_id), True
+
+
+async def _pipeline(text, session_id, prefer_tier, base_url,
+                    history_override=None, system_extra="", wait_timeout_s=None):
+    """共享编排：分级、上下文预算、前台即时回复、direct/async 分流。
+
+    `/chat` 与 `/v1/chat/completions` 都走这里，保证两条入口的路由决策、
+    历史预算与降级规则完全一致。本函数只返回结构化结果，不构造 HTTP 响应。
+
+    - `history_override`：请求自带历史（OpenAI 客户端），为 None 时读 SQLite；
+    - `system_extra`：请求里的 system 消息，追加到前台 system 之后；
+    - `wait_timeout_s`：走后台时等待完成的上限；None/0 表示不等待。
+    """
     if not text:
         raise HTTPException(status_code=400, detail="user_input 不能为空")
     if len(text) > config.MAX_INPUT_CHARS:
         raise HTTPException(
             status_code=413,
             detail=f"user_input 过长：{len(text)} 字符，当前配置上限 {config.MAX_INPUT_CHARS}")
-    if req.prefer_tier and req.prefer_tier not in config.TIER_ORDER:
+    if prefer_tier and prefer_tier not in config.TIER_ORDER:
         raise HTTPException(
             status_code=400,
-            detail=f"prefer_tier 必须是 {config.TIER_ORDER} 之一，收到 {req.prefer_tier!r}")
+            detail=f"prefer_tier 必须是 {config.TIER_ORDER} 之一，收到 {prefer_tier!r}")
 
-    session_id = req.session_id or str(uuid.uuid4())
-    base_url = str(request.base_url).rstrip("/")
-    tier, reason = classify(text, req.prefer_tier)
+    tier, reason = classify(text, prefer_tier)
     target_slot = config.TIER_TO_SLOT.get(tier) or config.DEFAULT_SLOT
     slot_key = slot_for_tier(tier)
     needs_backend = slot_key != config.FRONT_KEY
-    if slot_key != target_slot:
+    degraded = slot_key != target_slot
+    if degraded:
         reason += f"；{target_slot} 显存不足，已降级到 {slot_key}"
 
     # 队列已满时提前拒绝，不让用户白等一次前台生成
@@ -241,9 +260,14 @@ async def chat(req: ChatRequest, request: Request):
         _remaining,
         max(config.HISTORY_MIN_CHARS,
             int(_remaining * config.HISTORY_BUDGET_RATIO)))
-    history, history_truncated = store.get_history(
-        session_id, max_chars=history_budget,
-        max_messages=config.HISTORY_MAX_MESSAGES, with_meta=True)
+    if history_override is None:
+        history, history_truncated = store.get_history(
+            session_id, max_chars=history_budget,
+            max_messages=config.HISTORY_MAX_MESSAGES, with_meta=True)
+    else:
+        # 请求自带历史（OpenAI 语义）：用同一套预算裁剪，不读库、不重复累积
+        history, history_truncated = store.trim_history(
+            history_override, max_chars=history_budget)
     history_chars = sum(len(m["content"]) for m in history)
     context_usage = {
         "num_ctx": config.NUM_CTX,
@@ -261,6 +285,8 @@ async def chat(req: ChatRequest, request: Request):
     active = store.active_tasks(session_id)
 
     system = config.FRONT_SYSTEM
+    if system_extra:
+        system += "\n\n" + system_extra.strip()
     if history_truncated:
         system += prompts.HISTORY_TRUNCATED_NOTE
     if active:
@@ -304,10 +330,15 @@ async def chat(req: ChatRequest, request: Request):
         store.update_task(task_id, status="completed", progress=100,
                           final_reply=clean_instant,
                           release_info="简单任务由前台槽位直接完成")
-        return JSONResponse(_base_resp(text, session_id, task_id, tier,
-                                       "direct", instant, reason, "completed",
-                                       base_url, context=context_usage,
-                                       final_text=clean_instant))
+        return {
+            "text": text, "session_id": session_id, "task_id": task_id,
+            "tier": tier, "reason": reason, "mode": "direct",
+            "instant": instant, "final": clean_instant, "status": "completed",
+            "queue_position": None, "context_usage": context_usage,
+            "degraded": degraded, "slot_key": slot_key,
+            "history_chars": history_chars, "history_truncated": history_truncated,
+            "timed_out": False, "error": "",
+        }
 
     store.create_task(task_id, session_id, text, tier, clean_instant, reason)
     try:
@@ -315,11 +346,37 @@ async def chat(req: ChatRequest, request: Request):
     except asyncio.QueueFull:
         store.update_task(task_id, status="failed", error_msg="后台队列已满")
         raise HTTPException(status_code=429, detail="后台队列已满，请稍后重试")
-    return JSONResponse(_base_resp(text, session_id, task_id, tier,
-                                   "async", instant, reason, "pending",
-                                   base_url,
-                                   queue_position=max(0, queue.qsize() - 1),
-                                   context=context_usage))
+    queue_position = max(0, queue.qsize() - 1)
+
+    final, status, timed_out, error = "", "pending", False, ""
+    if wait_timeout_s:
+        task, timed_out = await _wait_task(task_id, wait_timeout_s)
+        if task:
+            status = task["status"]
+            final = task["final_reply"] or ""
+            error = task["error_msg"] or ""
+    return {
+        "text": text, "session_id": session_id, "task_id": task_id,
+        "tier": tier, "reason": reason, "mode": "async",
+        "instant": instant, "final": final, "status": status,
+        "queue_position": queue_position, "context_usage": context_usage,
+        "degraded": degraded, "slot_key": slot_key,
+        "history_chars": history_chars, "history_truncated": history_truncated,
+        "timed_out": timed_out, "error": error,
+    }
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest, request: Request):
+    text = (req.user_input or "").strip()
+    base_url = str(request.base_url).rstrip("/")
+    result = await _pipeline(text, req.session_id or str(uuid.uuid4()),
+                             req.prefer_tier, base_url)
+    return JSONResponse(_base_resp(
+        result["text"], result["session_id"], result["task_id"], result["tier"],
+        result["mode"], result["instant"], result["reason"], result["status"],
+        base_url, queue_position=result["queue_position"],
+        context=result["context_usage"], final_text=result["final"]))
 
 
 @app.get("/task_result")
@@ -388,3 +445,144 @@ async def config_info():
 @app.get("/tasks")
 async def tasks(limit: int = Query(20, ge=1, le=200)):
     return JSONResponse({"code": 200, "tasks": store.list_tasks(limit)})
+
+
+async def _stream_completion(parsed, result, req_id, created):
+    """SSE：先发即时回复保证首字，后台完成后再补最终结果。
+
+    每 10 秒发一次 SSE 注释行做心跳，避免长时间无数据被反向代理断开。
+    后台失败时补一段提示文本，而不是静默截断。
+    """
+    model = parsed["model"]
+    yield openai_api.sse(openai_api.chunk_payload(
+        req_id, created, model, {"role": "assistant", "content": ""}))
+    instant = result["instant"] or ""
+    for piece in openai_api.split_text(instant):
+        yield openai_api.sse(openai_api.chunk_payload(
+            req_id, created, model, {"content": piece}))
+
+    written = len(instant)
+    if result["mode"] == "async" and result["status"] in ("pending", "processing"):
+        deadline = time.time() + config.OPENAI_WAIT_TIMEOUT_S
+        task, ticks = None, 0
+        while time.time() < deadline:
+            task = store.get_task(result["task_id"])
+            if task and task["status"] in ("completed", "failed"):
+                break
+            await asyncio.sleep(1.0)
+            ticks += 1
+            if ticks % 10 == 0:
+                yield ": keep-alive\n\n"
+        if task and task["status"] == "completed":
+            final = task["final_reply"] or ""
+            # 两段之间留一个空行，避免即时回复与最终结果粘成一句
+            if final and final != instant:
+                for piece in openai_api.split_text("\n\n" + final):
+                    yield openai_api.sse(openai_api.chunk_payload(
+                        req_id, created, model, {"content": piece}))
+                written += 2 + len(final)
+        elif task and task["status"] == "failed":
+            note = f"\n\n[后台任务失败] {task.get('error_msg') or '未知错误'}"
+            for piece in openai_api.split_text(note):
+                yield openai_api.sse(openai_api.chunk_payload(
+                    req_id, created, model, {"content": piece}))
+            written += len(note)
+
+    yield openai_api.sse(openai_api.chunk_payload(
+        req_id, created, model, {}, finish_reason="stop"))
+    if parsed["include_usage"]:
+        yield openai_api.sse(openai_api.chunk_payload(
+            req_id, created, model,
+            usage=openai_api.estimate_usage(
+                len(result["text"]) + result["history_chars"], written)))
+    yield openai_api.sse_done()
+
+
+@app.get("/v1/models")
+async def openai_models():
+    """OpenAI 客户端的模型探测；返回的是路由别名，不是真实权重名。"""
+    return JSONResponse(openai_api.models_payload(config.TIER_ORDER, STARTED_AT))
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI 兼容入口：标准请求进，标准响应或 SSE 出。
+
+    与 `/chat` 的区别只在协议形态；路由、预算、降级、结果原样递回完全一致。
+    请求内 messages 自带历史时服务端按无状态处理（不读 SQLite）；
+    只发一条 user 且带 `X-Session-Id` 或 `user` 字段时，才读服务端历史。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            openai_api.error_payload("请求体不是合法 JSON"), status_code=400)
+    try:
+        parsed = openai_api.parse_request(body, dict(request.headers))
+    except openai_api.OpenAIError as exc:
+        return JSONResponse(
+            openai_api.error_payload(exc.message, exc.type, exc.code, exc.param),
+            status_code=exc.status)
+
+    # 流式必须先吐即时回复，所以不在编排层等待；非流式 final 模式才等后台
+    wait_s = 0 if parsed["stream"] else (
+        config.OPENAI_WAIT_TIMEOUT_S if parsed["mode"] == openai_api.MODE_FINAL else 0)
+    history_override = parsed["history"] if parsed["history"] else (
+        None if parsed["session_id"] else [])
+    session_id = parsed["session_id"] or f"oai-{uuid.uuid4().hex[:12]}"
+    try:
+        result = await _pipeline(
+            parsed["text"], session_id, parsed["tier"],
+            str(request.base_url).rstrip("/"),
+            history_override=history_override,
+            system_extra=parsed["system_extra"],
+            wait_timeout_s=wait_s)
+    except HTTPException as exc:
+        type_ = "rate_limit_error" if exc.status_code == 429 else "invalid_request_error"
+        code = "context_length_exceeded" if exc.status_code == 413 else None
+        return JSONResponse(
+            openai_api.error_payload(str(exc.detail), type_, code),
+            status_code=exc.status_code)
+
+    req_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    created = int(time.time())
+    if parsed["stream"]:
+        return StreamingResponse(
+            _stream_completion(parsed, result, req_id, created),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    if result["status"] == "failed":
+        return JSONResponse(
+            openai_api.error_payload(
+                f"后台任务失败：{result['error'] or '未知错误'}",
+                "server_error", "backend_failed"),
+            status_code=502)
+
+    if result["mode"] == "async" and result["status"] == "completed":
+        content = result["final"] or result["instant"]
+    else:
+        content = result["instant"]
+
+    explore = {
+        "task_id": result["task_id"],
+        "task_status": result["status"],
+        "process_mode": result["mode"],
+        "tier": result["tier"],
+        "chosen_slot": result["slot_key"],
+        "instant_reply": result["instant"],
+        "queue_position": result["queue_position"],
+        "degraded": result["degraded"],
+        "history_truncated": result["history_truncated"],
+        "num_ctx": config.NUM_CTX,
+        "selection_reason": result["reason"],
+    }
+    if result["timed_out"]:
+        explore["fallback"] = "timeout"
+        explore["hint"] = "后台仍在运行，可轮询 /task_result?task_id=... 获取完整结果"
+
+    return JSONResponse(openai_api.completion_payload(
+        req_id, created, parsed["model"], content, "stop",
+        openai_api.estimate_usage(
+            len(result["text"]) + result["history_chars"], len(content)),
+        explore))

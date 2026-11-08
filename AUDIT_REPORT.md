@@ -2,7 +2,7 @@
 
 > 审计时间：2026-11-06 02:24 – 03:35（GMT+8，含长上下文与单卡阈值补充轮）
 > 目标机：Ubuntu 22.04.5 / 双卡 NVIDIA RTX 3080 20G（共 40960 MiB）/ CUDA
-> 项目版本：2.2.1（配置驱动版）
+> 项目版本：2.3.0（配置驱动版）
 > 审计方式：**真机、真模型、真进程故障，不使用 mock / 模拟数据**
 
 ## 1. 审计范围与方法
@@ -329,4 +329,57 @@ python3 tests/msg_rounds_test.py 1   # 小数据量：短对话，全部直答
 python3 tests/msg_rounds_test.py 2   # 中等：300–900 字/轮，前台 + 中档 + 重档
 python3 tests/msg_rounds_test.py 3   # 大：3,000–5,000 字/轮，压上下文预算
 # 结果写入 logs/msgtest_round<N>.json，含每轮字符数、模式、槽位、历史预算与截断标记
+```
+
+---
+
+## 13. 补充：OpenAI 兼容层真机测试（2026-11-08 18:30–18:40）
+
+### 13.1 变更范围
+
+新增 `/v1/chat/completions` 与 `/v1/models`，把「即时回复 + 后台任务」的自定义协议适配成标准 OpenAI 协议；`/chat` 保持原样。两条入口共用 `app/main.py::_pipeline()`，路由、上下文预算、降级与结果原样递回完全一致。
+
+### 13.2 测试环境
+
+同一台设备（`liuda-API`，Ubuntu 22.04 / Python 3.10.12），双卡 RTX 3080 20G，CUDA，`num_ctx=32768`，`openai.default_mode=final`、`wait_timeout_s=120`。服务冷启动后前台 `ready`，测试结束已停服、端口释放。
+
+### 13.3 结果：36/36 通过
+
+| 组 | 覆盖 | 结果 |
+|---|---|---|
+| 模型探测 | `/v1/models` 的 `object=list`、`explore`、`explore-fast`、`explore-<tier>` | 4/4 |
+| direct | `object=chat.completion`、content 非空、`process_mode=direct`、`task_status=completed`、usage 为正 | 7/7 |
+| instant | 立即返回（非阻塞）、`process_mode=async`、给出 `task_id`、后台最终 `completed`、即时回复不等于后台结果 | 7/7 |
+| final | 同步等到 `completed`、tier 命中、**content 与自身 task 的 `final_reply` 逐字一致**、content 与即时回复不同 | 6/6 |
+| 流式（direct） | `text/event-stream`、首帧 `role=assistant`、正文增量、`finish_reason=stop`、`[DONE]` | 5/5 |
+| 流式（async） | 两段内容、正常收尾、期间持续有数据帧 | 3/3 |
+| 错误路径 | 空 messages `400` + OpenAI 错误体、非法 `explore_mode` `400` + `invalid_mode`、超长输入 `413` + `context_length_exceeded` | 3/3 |
+| 合计 | | **36/36** |
+
+### 13.4 关键验证
+
+- **结果原样递回可验证**：`final` 模式的 `choices[0].message.content` 与该响应 `explore.task_id` 对应任务的 `final_reply` **逐字相等**（222 字对 222 字）。
+- **instant 不偷塞后台结果**：`instant` 模式返回的是前台即时回复（440 字），后台结果（222 字）只落在 `/task_result`，两者内容不同。
+- **超时回退实测**：临时把 `wait_timeout_s` 调到 3s，heavy 请求 5.09s 返回，`explore.fallback=timeout`、`task_status=processing`、content 等于即时回复、附 `hint`；该任务随后自行完成（`final_reply` 222 字），证明"超时不丢任务"。
+- **`/chat` 未回归**：`tests/test_smoke.py` 11/11，`all_pass: true`；上下文恒定 `32768 → 32768`；槽位切换正常。
+
+### 13.5 设备状态说明（非协议层问题）
+
+本次 `moe` 槽位被 `vram_plan` 标记为 `available=false`：
+
+```
+gpu1: need 17333MB > usable 17243MB (free 19671MB, front 0MB)
+```
+
+差值仅 90MB，原因是启动瞬间 gpu1 的 free 比 2026-11-06 测试时少约 1GB（桌面/其它进程占用），导致 `heavy` 按设计降级到 `mid`。这正好验证了**降级路径可用**：响应里 `tier=heavy`、`chosen_slot=mid`，链路正常完成。
+
+但这意味着本轮 heavy 任务实际由 9B 完成，**未覆盖 35B MoE**。需要跑重档的机器请按实际 free 校准 `slots.moe.vram_mb` 或 `split_ratio`，再用 `/config` 确认 `vram_plan.moe.available=true`。
+
+### 13.6 复现
+
+```bash
+cd <工作区>
+PYTHONPATH=$PWD/pylib:$PWD python3 tests/test_openai_api.py
+# 结果写入 logs/openai_api_test.json，含逐项 check 与 passed/total
+PYTHONPATH=$PWD/pylib:$PWD python3 tests/test_smoke.py   # /chat 回归
 ```

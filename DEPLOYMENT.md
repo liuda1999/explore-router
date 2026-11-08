@@ -2,7 +2,7 @@
 
 > **English summary**: A complete, device-agnostic deployment runbook — prerequisites, the exact startup sequence, three hardware scenarios (multi-GPU NVIDIA / single AMD / small-VRAM single card), environment overrides, a first-boot acceptance checklist, regression commands, failure triage, upgrade/rollback, and CI wiring. Short version in [README.md](README.md); component rationale in [TECH_STACK.md](TECH_STACK.md).
 >
-> **版本** v2.2.1 ｜ **更新** 2026-11-06
+> **版本** v2.3.0 ｜ **更新** 2026-11-08
 > **核心原则**：不写死路径、不装系统服务、不设开机自启、不污染系统 Python 环境。
 
 ---
@@ -191,6 +191,12 @@ curl -s -X POST http://127.0.0.1:8100/chat \
   -H 'Content-Type: application/json' \
   -d '{"user_input":"请详细分析并给出完整方案","session_id":"deploy-check","prefer_tier":"heavy"}'
 curl -s 'http://127.0.0.1:8100/task_result?task_id=<上一步的 task_id>'
+
+# OpenAI 兼容层：应返回虚拟模型名与标准 chat.completion 响应
+curl -s http://127.0.0.1:8100/v1/models
+curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","messages":[{"role":"user","content":"2+2 等于几"}]}'
 ```
 
 **验收清单 / Acceptance checklist**
@@ -206,7 +212,8 @@ curl -s 'http://127.0.0.1:8100/task_result?task_id=<上一步的 task_id>'
 | 7 | 复杂任务 | `process_mode=async`，`final_reply` 非空且为后台原始输出 |
 | 8 | 进度提问 | 返回 `[后台任务进度]` 真实状态 |
 | 9 | `/chat` 的 `context_usage` | `estimated_total_chars <= num_ctx` |
-| 10 | 停止后 | `./run.sh status` 显示 not running；本项目端口释放 |
+| 10 | `/v1/models` 与 `/v1/chat/completions` | 返回 `explore` 等虚拟模型名；`object=chat.completion`，`content` 非空，`explore.task_id` 可查 |
+| 11 | 停止后 | `./run.sh status` 显示 not running；本项目端口释放 |
 
 ### Step 8 · 回归测试
 

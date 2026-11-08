@@ -122,6 +122,13 @@ routing:
     - implement
     - explain in detail
 
+# ── OpenAI 兼容层（/v1/chat/completions 与 /v1/models）──────────
+# 与 /chat 并存：/chat 是「即时回复 + task_id 轮询」的自定义协议；
+# /v1 是给 Cherry Studio / Open WebUI / Dify 等标准客户端的适配层。
+openai:
+  default_mode: final             # final = 等后台完成再返回；instant = 只返回即时回复
+  wait_timeout_s: 120             # final 模式等待后台完成的上限（秒）；0 = 不等待
+
 frontend:
   max_tokens: 256                 # 即时回复上限
   # 历史预算按 num_ctx 自动计算：短输入多带历史，长输入自动收紧，不写死条数。

@@ -1,6 +1,6 @@
 # explore · Intelligent Local LLM Router — Project Introduction
 
-> **Version** v2.2.1 ｜ **Updated** 2026-11-06 ｜ **Configuration-driven edition**
+> **Version** v2.3.0 ｜ **Updated** 2026-11-08 ｜ **Configuration-driven edition**
 > Workspace: `<deployment directory>` (scripts resolve paths from their own location; nothing is hard-coded)
 > Bilingual entry point: [README.md](README.md) ｜ 中文版: [PROJECT_INTRO.md](PROJECT_INTRO.md)
 
@@ -270,18 +270,54 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 
 ## 11. HTTP interface
 
+Two entry points share one orchestration layer (`app/main.py::_pipeline`): `/chat` is the custom "instant reply + task_id" protocol, `/v1/*` is the OpenAI-compatible layer for standard clients. Routing, context budgeting, degradation and verbatim result pass-through are identical — only the wire format differs.
+
 | Endpoint | Description |
 |---|---|
 | `POST /chat` | Body `{user_input, session_id?, prefer_tier?}`; returns `instant_reply`, `process_mode`, `task_id`, `num_ctx`, `queue_position`, `context_usage` |
+| `POST /v1/chat/completions` | OpenAI-compatible; standard request in, standard response or SSE out |
+| `GET /v1/models` | Virtual model names: `explore` (auto), `explore-fast` (instant reply only), `explore-<tier>` |
 | `GET /task_result` | Status, progress, `final_reply` (verbatim), chosen slot, real prefill time, error info |
 | `GET /health` | Backend, `num_ctx`, front, slot, queue, embedding (1024-d self-check), VRAM, config summary |
 | `GET /config` | **Effective configuration** — check after every model/device change |
 | `GET /gpu` | Per-card model / VRAM / driver |
 | `GET /tasks` | Recent tasks (`limit` 1–200) |
 
-**Error contract**: empty input `400`; oversized input `413` (`routing.max_input_chars`); invalid `prefer_tier` `400`; queue full `429` (`runtime.queue_maxsize`); unknown task returns `code=404`.
+**Error contract**: empty input `400`; oversized input `413` (`routing.max_input_chars`); invalid `prefer_tier` `400`; queue full `429` (`runtime.queue_maxsize`); unknown task returns `code=404`. `/v1/*` uses the OpenAI error body `{"error":{message,type,param,code}}` and returns `502` when the backend task fails.
 
 Valid `prefer_tier` values come from the keys of `routing.tier_to_slot` (default `simple/mid/heavy`, renamable via `tier_order`). For complex tasks, `final_reply` is the backend model's **raw output**. Ports, backend, slots and models all come from configuration; numeric values in this document are default examples.
+
+### 11.1 OpenAI-compatible layer
+
+The custom `/chat` protocol ("instant reply + background task") is not something Cherry Studio, Open WebUI or Dify understand. This layer **does not duplicate business logic** — it only converts protocols, and both entry points call the same `_pipeline()`.
+
+**Model name mapping**
+
+| Requested `model` | Behaviour |
+|---|---|
+| `explore` / `explore-auto` / anything unrecognised (e.g. `gpt-3.5-turbo`) | Automatic classification; no error |
+| `explore-simple` / `explore-mid` / `explore-heavy` | Force a tier (values come from `routing.tier_order`) |
+| `explore-front` / `explore-mid` / `explore-moe` | Reverse-lookup the tier from a slot name |
+| `explore-fast` | Automatic classification + instant reply only |
+
+Unrecognised model names are **not rejected** — they fall back to automatic routing, because many clients hard-code names such as `gpt-3.5-turbo`.
+
+**Two return modes**
+
+| Mode | How to select | Behaviour |
+|---|---|---|
+| `final` (default) | `explore_mode=final` / `X-Explore-Mode: final` / omitted | Blocks until the backend finishes (`openai.wait_timeout_s`, default 120s); `content` is the complete result. On timeout it falls back to the instant reply and sets `explore.fallback=timeout` |
+| `instant` | `explore_mode=instant` / `X-Explore-Mode: instant` / model suffixed `-fast` | Returns the instant reply immediately; `explore.task_id` can be polled via `/task_result` |
+
+Precedence: `explore_mode` > `X-Explore-Mode` > model suffix > `openai.default_mode`.
+
+**Streaming**: `stream=true` returns SSE. The instant reply is streamed first to keep first-token latency low; once the backend finishes, the final result is appended after a blank line. `stream_options.include_usage=true` adds a trailing usage frame. This is **chunked delivery, not token-by-token streaming** — the upstream `llama-server` call is `stream=false`; chunking only provides protocol compatibility.
+
+**Conversation semantics**: when `messages` carries history, the server is stateless and does not read SQLite. Only when a single user message is sent with `X-Session-Id` (or the `user` field) does it read server-side history. `system` messages are appended to the front model's system prompt rather than replacing the routing persona.
+
+**`explore` extension fields**: `task_id`, `task_status`, `process_mode` (direct/async), `tier`, `chosen_slot`, `instant_reply`, `queue_position`, `degraded`, `history_truncated`, `num_ctx`, `selection_reason`; timeouts also carry `fallback` and `hint`.
+
+**Trade-offs**: `temperature` / `max_tokens` are echoed but not applied — sampling is controlled server-side by configuration. `usage` is estimated from character counts (roughly 1 token per 1.5 CJK characters), not exact tokenizer output.
 
 ---
 

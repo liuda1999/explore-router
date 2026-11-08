@@ -1,6 +1,6 @@
 # explore 智能本地路由 — 项目介绍
 
-> **版本** v2.2.1 ｜ **更新** 2026-11-06 ｜ **配置驱动版**
+> **版本** v2.3.0 ｜ **更新** 2026-11-08 ｜ **配置驱动版**
 > 工作区：`<部署目录>`（脚本按自身位置定位，不写死路径）
 > 双语入口：[README.md](README.md) ｜ English edition: [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md)
 
@@ -270,18 +270,54 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 
 ## 11. 对外接口
 
+两套入口共用同一套编排（`app/main.py::_pipeline`）：`/chat` 是「即时回复 + task_id」的自定义协议，`/v1/*` 是给标准客户端用的 OpenAI 兼容层。路由、上下文预算、降级、结果原样递回完全一致，差别只在协议形态。
+
 | 接口 | 说明 |
 |---|---|
 | `POST /chat` | 请求 `{user_input, session_id?, prefer_tier?}`；返回 `instant_reply`、`process_mode`、`task_id`、`num_ctx`、`queue_position`、`context_usage` 等 |
+| `POST /v1/chat/completions` | OpenAI 兼容；标准请求进，标准响应或 SSE 出 |
+| `GET /v1/models` | 虚拟模型名：`explore`（自动）、`explore-fast`（只回即时回复）、`explore-<tier>` |
 | `GET /task_result` | 状态、进度、`final_reply`（原样）、所选槽位、真实 prefill 耗时、错误信息 |
 | `GET /health` | 后端、`num_ctx`、前台、槽位、队列、embedding（启动自检 1024 维）、显存、`config` 摘要 |
 | `GET /config` | **当前生效配置**（换模型/换设备后必看） |
 | `GET /gpu` | 各卡型号 / 显存 / 驱动 |
 | `GET /tasks` | 最近任务（`limit` 1–200） |
 
-**错误约定**：空输入 `400`；超长输入 `413`（`routing.max_input_chars`）；非法 `prefer_tier` `400`；队列满 `429`（`runtime.queue_maxsize`）；任务不存在返回 `code=404`。
+**错误约定**：空输入 `400`；超长输入 `413`（`routing.max_input_chars`）；非法 `prefer_tier` `400`；队列满 `429`（`runtime.queue_maxsize`）；任务不存在返回 `code=404`。`/v1/*` 使用 OpenAI 错误体 `{"error":{message,type,param,code}}`，后台失败返回 `502`。
 
 `prefer_tier` 的可选值来自 `routing.tier_to_slot` 的 key（默认 `simple/mid/heavy`，可由 `tier_order` 改名）。复杂任务的 `final_reply` 是后台模型**原始输出**。端口、后端、槽位、模型全部来自配置，文档中的具体数字均为默认示例。
+
+### 11.1 OpenAI 兼容层
+
+`/chat` 的「即时回复 + 后台任务」是自定义协议，Cherry Studio / Open WebUI / Dify 这类客户端只认 OpenAI 协议。兼容层**不复制业务逻辑**，只做协议转换，两条入口共用 `_pipeline()`。
+
+**model 名映射**
+
+| 请求的 `model` | 行为 |
+|---|---|
+| `explore` / `explore-auto` / 无法识别的名字（如 `gpt-3.5-turbo`） | 自动分级，不报错 |
+| `explore-simple` / `explore-mid` / `explore-heavy` | 指定档位（前缀后的值来自 `routing.tier_order`） |
+| `explore-front` / `explore-mid` / `explore-moe` | 用槽位名反查档位 |
+| `explore-fast` | 自动分级 + 只返回即时回复 |
+
+无法识别的 model **不报错**，按自动路由处理——很多客户端会硬编码 `gpt-3.5-turbo` 之类的名字。
+
+**两种返回模式**
+
+| 模式 | 触发方式 | 行为 |
+|---|---|---|
+| `final`（默认） | `explore_mode=final` / `X-Explore-Mode: final` / 不传 | 阻塞到后台完成（`openai.wait_timeout_s`，默认 120s），`content` 为完整结果；超时回退即时回复并标 `explore.fallback=timeout` |
+| `instant` | `explore_mode=instant` / `X-Explore-Mode: instant` / model 带 `-fast` 后缀 | 立即返回即时回复，`explore.task_id` 供轮询 `/task_result` |
+
+优先级：`explore_mode` > `X-Explore-Mode` > model 后缀 > `openai.default_mode`。
+
+**流式**：`stream=true` 返回 SSE。先流出即时回复保证首字，后台完成后继续流出最终结果，两段之间空一行；`stream_options.include_usage=true` 时末尾附 usage 帧。这是**分块发送，不是逐 token 流式**——底层 `llama-server` 调用是 `stream=false`，分块只为协议兼容。
+
+**会话语义**：`messages` 自带历史时服务端按无状态处理，不读 SQLite；只发一条 user 且带 `X-Session-Id`（或 `user` 字段）时才读服务端历史。`system` 消息追加到前台 system 之后，不替换路由人格。
+
+**响应扩展字段** `explore`：`task_id`、`task_status`、`process_mode`（direct/async）、`tier`、`chosen_slot`、`instant_reply`、`queue_position`、`degraded`、`history_truncated`、`num_ctx`、`selection_reason`；超时另有 `fallback` 与 `hint`。
+
+**取舍**：`temperature` / `max_tokens` 只回显不生效，采样由服务端配置统一控制；`usage` 是按字符数估算的近似值（中文约 1 token / 1.5 字），不是 tokenizer 精确计数。
 
 ---
 
