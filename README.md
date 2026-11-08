@@ -171,6 +171,7 @@ Audited on real hardware with real models, real process crashes and real restart
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Deployment & startup runbook, hardware scenarios, acceptance checklist |
 | [OPERATIONS.md](OPERATIONS.md) | Day-2 operations: swap models / devices, monitoring, troubleshooting, rollback |
 | [AUDIT_REPORT.md](AUDIT_REPORT.md) | Full real-machine audit and CI results |
+| [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md) | Pre-release acceptance stress test: long context, concurrency, streaming, log checks |
 | [TEST_REPORT.md](TEST_REPORT.md) | Historical device-specific measurements |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | Historical development log (requirements evolution, not a current constraint) |
 | [settings.yaml](settings.yaml) | The single source of truth |
@@ -347,6 +348,7 @@ curl -s -X POST http://127.0.0.1:8100/v1/responses \
 | [DEPLOYMENT.md](DEPLOYMENT.md) | 部署与启动流程、硬件场景、验收清单 |
 | [OPERATIONS.md](OPERATIONS.md) | 日常运维：换模型 / 换设备、监控、排障、回滚 |
 | [AUDIT_REPORT.md](AUDIT_REPORT.md) | 全量真机审计与 CI 结果 |
+| [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md) | 发布前验收压测：长上下文、并发、流式、日志核查 |
 | [TEST_REPORT.md](TEST_REPORT.md) | 特定设备的历史实测 |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | 历史开发记录（需求演进，非当前约束） |
 | [settings.yaml](settings.yaml) | 唯一配置源 |

@@ -16,7 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = [ROOT / name for name in
         ("README.md", "OPERATIONS.md", "PROJECT_INTRO.md",
          "PROJECT_INTRO.en.md", "TECH_STACK.md", "DEPLOYMENT.md",
-         "TEST_REPORT.md", "AUDIT_REPORT.md")]
+         "TEST_REPORT.md", "AUDIT_REPORT.md", "ACCEPTANCE_REPORT.md")]
 SETTINGS = ROOT / "settings.yaml"
 
 routes = set()
