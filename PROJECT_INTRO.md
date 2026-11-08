@@ -260,7 +260,10 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 ```
 
 - 短输入时多带历史，长输入时自动收紧；`history_max_messages` 限制极端多轮拖慢 prefill。
-- `store.py` 按预算截断并规范化历史：合并连续同角色消息、丢弃窗口开头孤立的 assistant，避免部分 GGUF 的 Jinja 模板因角色不交替而返回 500。
+- `store.py` 按预算切分历史并规范化：合并连续同角色消息、丢弃窗口开头孤立的 assistant，避免部分 GGUF 的 Jinja 模板因角色不交替而返回 500。
+- **先压缩再丢弃**：被预算裁掉的早期轮次不会直接消失。`context.compaction` 开启时，调用前台模型把「本轮将被丢弃的部分」摘要成一段（默认上限 800 字），插入 system 作为「更早对话摘要（已压缩）」。摘要采用**滚动合并**——已有摘要 + 新增丢弃内容 → 新摘要，并要求暗号/编号逐字保留、首行单独列 `【关键标记】`。若每次都按全量重算，400 字摘要会被新内容占满、最早的暗号被挤掉；这是实测踩到的坑，容量与滚动机制两者缺一不可。
+- 摘要失败、被丢弃内容过短（`min_dropped_chars`）或关闭压缩时，退回原行为：丢弃 + `history_truncated` 标记，不影响主链路。
+- `/chat` 的 `context_usage` 返回 `history_truncated`、`context_compressed`、`summary_chars` 与 `compaction`（含 `cached`、`dropped_messages`、`dropped_chars`），可判断这一轮是「原文保留」「压缩保留」还是「直接丢弃」。
 - `/chat` 返回 `context_usage`，可观测「估算总字符 ≤ num_ctx」。
 - 输入上限 `routing.max_input_chars` 默认 `auto`（可用上下文 − 最小历史预算），超限返回 `413`。
 
@@ -412,7 +415,7 @@ GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)�
 - **AMD ROCm 路径**已完成代码与配置解析层验证，但**没有 AMD 硬件真机实测**；上线前需在目标机跑静态层 + 短集成。
 - **16G 单卡**未在真实 16G 卡上验证；已在双卡机上用只暴露单卡（20G）的方式验证「重档不可用 → 自动降级」的完整链路。
 - **`vram_mb` 是「权重 + KV」估算值**，需按目标机实测校准；偏差过大可能误判可用性。
-- **早期历史不可召回，且模型可能误答**：预算外的轮次会被丢弃，`context_usage.history_truncated` 会标记为 `true`，system 中也会提示「更早的记录已不可用」；但真机实测表明，轻量前台（3B）仍可能把最近轮次误认为更早内容并自信作答。**不要依赖截断后的早期召回**；需要精确回溯时，应由客户端保留原始记录。这是不加检索层的代价。
+- **压缩后仍有信息损失**：预算外的轮次不再直接丢弃——开启 `context.compaction` 时会滚动摘要保留，暗号/编号要求逐字复制，真机实测可召回第一轮标记。但摘要终究是压缩产物，仍可能漏项或轻微失真；需要精确回溯时应由客户端保留原始记录。关闭压缩（或摘要失败）时退回旧行为：丢弃 + `history_truncated` 标记，轻量前台仍可能误答更早轮次。
 - **无流式输出**；长任务需轮询 `/task_result`。
 - **无鉴权、无速率限制**；默认绑 `127.0.0.1`，对外必须加反向代理与鉴权、TLS。
 - **日志与 SQLite 无自动轮转/清理**，长期运行需外部 logrotate 与定期归档。

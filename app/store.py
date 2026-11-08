@@ -75,6 +75,13 @@ def init():
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_resp_session "
                   "ON responses(session_id, created_at)")
+        # 上下文压缩的滚动摘要：按会话保存，增量合并，避免每次对全量重算
+        c.execute("""CREATE TABLE IF NOT EXISTS session_summaries (
+            session_id TEXT PRIMARY KEY,
+            summary TEXT NOT NULL,
+            covered_messages INTEGER DEFAULT 0,
+            updated_at REAL
+        )""")
 
 
 def reset_inflight():
@@ -172,6 +179,23 @@ def get_response(response_id):
     return dict(row) if row else None
 
 
+def get_session_summary(session_id):
+    """取该会话的滚动摘要：{summary, covered_messages} 或 None。"""
+    with _lock, _db() as c:
+        row = c.execute(
+            "SELECT summary, covered_messages FROM session_summaries "
+            "WHERE session_id=?", (session_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def save_session_summary(session_id, summary, covered_messages):
+    with _lock, _db() as c:
+        c.execute("INSERT OR REPLACE INTO session_summaries "
+                  "(session_id, summary, covered_messages, updated_at) "
+                  "VALUES (?,?,?,?)",
+                  (session_id, summary, int(covered_messages), time.time()))
+
+
 def append_message(session_id, role, content):
     """写入会话消息；连续同角色合并，保证 chat template 要求的 user/assistant 交替。
 
@@ -196,15 +220,8 @@ def append_message(session_id, role, content):
                 (session_id, role, content, time.time()))
 
 
-def trim_history(msgs, max_chars=None):
-    """对任意消息列表做角色规范化与预算裁剪（纯函数，不读库）。
-
-    规则与 get_history 完全一致：合并连续同角色、丢弃开头的非 user 与
-    结尾的非 assistant、按字符预算从最近往前保留完整轮次。
-    OpenAI 兼容层自带 messages，用它复用同一套预算逻辑，避免两套实现漂移。
-
-    返回 (messages, truncated)。
-    """
+def _normalize(msgs):
+    """合并连续同角色、丢弃开头非 user 与结尾非 assistant。返回 (out, truncated)。"""
     out = []
     truncated = False
     for m in msgs:
@@ -224,29 +241,52 @@ def trim_history(msgs, max_chars=None):
     while out and out[-1]["role"] != "assistant":
         out.pop()
         truncated = True
+    return out, truncated
 
+
+def split_history(msgs, max_chars=None):
+    """按预算切分历史，返回 `(kept, dropped, truncated)`。
+
+    与 trim_history 的区别：把「被预算裁掉的部分」也返回出来，供上下文压缩
+    使用——先摘要把丢弃内容保留成一段摘要，而不是直接扔掉。
+    """
+    out, truncated = _normalize(msgs)
     if max_chars is None:
-        return out, truncated
+        return out, [], truncated
 
-    selected = []
+    kept = []
     total_chars = 0
+    cut = len(out)                      # 保留区间的起点
     i = len(out) - 1
     while i >= 0:
         if (out[i]["role"] == "assistant" and i - 1 >= 0
                 and out[i - 1]["role"] == "user"):
-            pair = [out[i - 1], out[i]]
-            i -= 2
+            start = i - 1
         else:
-            pair = [out[i]]
-            i -= 1
+            start = i
+        pair = out[start:i + 1]
         pair_chars = sum(len(m["content"]) for m in pair)
         if total_chars + pair_chars > max_chars:
-            # 最近一对都放不下时返回空历史，优先保证不溢出
-            truncated = True
             break
-        selected = pair + selected
+        kept = pair + kept
         total_chars += pair_chars
-    return selected, truncated
+        cut = start
+        i = start - 1
+    dropped = out[:cut]
+    return kept, dropped, truncated or bool(dropped)
+
+
+def trim_history(msgs, max_chars=None):
+    """对任意消息列表做角色规范化与预算裁剪（纯函数，不读库）。
+
+    规则与 get_history 完全一致：合并连续同角色、丢弃开头的非 user 与
+    结尾的非 assistant、按字符预算从最近往前保留完整轮次。
+    OpenAI 兼容层自带 messages，用它复用同一套预算逻辑，避免两套实现漂移。
+
+    返回 (messages, truncated)。
+    """
+    kept, _dropped, truncated = split_history(msgs, max_chars)
+    return kept, truncated
 
 
 def get_history(session_id, max_chars=None, max_messages=40, with_meta=False):
@@ -270,3 +310,22 @@ def get_history(session_id, max_chars=None, max_messages=40, with_meta=False):
     out, cut = trim_history(msgs, max_chars=max_chars)
     truncated = truncated or cut
     return (out, truncated) if with_meta else out
+
+
+def get_history_split(session_id, max_chars=None, max_messages=40):
+    """取历史并返回 `(kept, dropped, truncated)`。
+
+    `dropped` 是按预算会被丢弃的早期轮次，交给上下文压缩做摘要，
+    避免「预算不够就直接丢失早期信息」。
+    """
+    with _lock, _db() as c:
+        total_rows = int(c.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id=?", (session_id,)
+        ).fetchone()[0])
+        rows = c.execute(
+            "SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, max_messages)).fetchall()
+    truncated = total_rows > len(rows)
+    msgs = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    kept, dropped, cut = split_history(msgs, max_chars=max_chars)
+    return kept, dropped, truncated or cut

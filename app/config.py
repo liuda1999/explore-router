@@ -194,6 +194,16 @@ HISTORY_MIN_CHARS = int(_front.get("history_min_chars", 2048))
 HISTORY_MAX_MESSAGES = int(_front.get("history_max_messages", 40))
 CONTEXT_SAFETY_TOKENS = int(_front.get("context_safety_tokens", 256))
 
+# 上下文压缩：预算不足时先把将被丢弃的早期轮次摘要保留，再考虑丢弃
+_comp = _ctx.get("compaction", {}) or {}
+COMPACTION_ENABLED = str(_env(
+    "COMPACTION_ENABLED", _comp.get("enabled", True))).lower() not in (
+    "0", "false", "no", "off")
+COMPACTION_MAX_SUMMARY_CHARS = max(80, int(_env(
+    "COMPACTION_MAX_SUMMARY_CHARS", _comp.get("max_summary_chars", 400))))
+COMPACTION_MIN_DROPPED_CHARS = max(0, int(_env(
+    "COMPACTION_MIN_DROPPED_CHARS", _comp.get("min_dropped_chars", 600))))
+
 # 按 1 字符≈1 token 保守估算，为输出、system、安全余量、最小历史预留
 _CTX_AVAILABLE = NUM_CTX - FRONT_MAX_TOKENS - CONTEXT_SAFETY_TOKENS - len(FRONT_SYSTEM)
 if _CTX_AVAILABLE <= 0:
@@ -371,6 +381,11 @@ def describe():
             "history_min_chars": HISTORY_MIN_CHARS,
             "history_max_messages": HISTORY_MAX_MESSAGES,
             "context_safety_tokens": CONTEXT_SAFETY_TOKENS,
+        },
+        "compaction": {
+            "enabled": COMPACTION_ENABLED,
+            "max_summary_chars": COMPACTION_MAX_SUMMARY_CHARS,
+            "min_dropped_chars": COMPACTION_MIN_DROPPED_CHARS,
         },
         "paths": {"data": str(DATA), "logs": str(LOGS)},
         "openai": {

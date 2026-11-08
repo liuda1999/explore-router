@@ -147,7 +147,12 @@ def snapshot(prefer=None, force=False):
 
 
 def split_ratio_for(snap, devices):
-    """按各卡空闲显存生成分层比例；单卡返回 None（不启用多卡分层）。"""
+    """按各卡空闲显存生成分层比例；单卡返回 None（不启用多卡分层）。
+
+    比例放大 10 倍取整：直接用 round(free/base) 会把 1.3 压成 1，
+    退化为均分，浪费空闲更多那张卡的显存。10 倍精度足以表达 0.1 的差异，
+    同时保持数值很小，`-ts` 归一化后与 MB 比例等价。
+    """
     gpus = snap.get("gpus", [])
     if len(devices) < 2:
         return None
@@ -157,4 +162,4 @@ def split_ratio_for(snap, devices):
         g = by_index.get(int(i)) or (gpus[0] if gpus else {})
         free.append(max(1, int(g.get("free_mb", 1))))
     base = min(free)
-    return [max(1, round(f / base)) for f in free]
+    return [max(1, round(f / base * 10)) for f in free]

@@ -33,6 +33,12 @@ context:
     # 项目最低支持 32K；更大上下文需显存实测后加表项，或用 NUM_CTX 临时覆盖。
     - {min_total_mb: 80000, num_ctx: 65536}
     - {min_total_mb: 0, num_ctx: 32768}
+  # 上下文压缩：历史超出预算时，先把「会被丢弃的早期轮次」摘要成一段保留，
+  # 再考虑丢弃。摘要由前台常驻模型生成，结果按内容哈希缓存，只做一次。
+  compaction:
+    enabled: true
+    max_summary_chars: 800        # 摘要长度上限（字符）；太小会挤掉早期暗号
+    min_dropped_chars: 600        # 被丢弃内容少于该值时直接丢弃，不值得摘要
 
 embedding:
   onnx: models/embedding/fast-bge-base-zh-v1.5/onnx/model_quantized.onnx
@@ -81,9 +87,8 @@ slots:
     weight_mb: 21300
     vram_mb: 26000
     placement: spread             # 多卡时自动分层；单卡时自动退化为单卡
-    # 当前双卡设备的调优值：前台常驻第一张卡，故让重档偏向另一张卡。
-    # 换设备（尤其单卡）时应删除本行，改由「空闲显存 - 前台预估占用」自动计算。
-    split_ratio: [1, 2]
+    # 分层比例默认按「各卡空闲显存 - 前台预估占用」自动计算，不需要写死。
+    # 只有自动算偏时（例如卡上还有别的服务占显存）才显式写 split_ratio: [1, 2]。
     resident: false
 
 routing:

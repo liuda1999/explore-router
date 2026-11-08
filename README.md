@@ -36,6 +36,7 @@ The original constraint was a single 16 GB GPU that could not hold several large
 | **Observable progress** | Asking "how is it going" attaches the real task state from SQLite, not a generated guess. |
 | **Automatic VRAM guard** | `vram_plan` evaluates visible GPUs at startup. A slot that does not fit is marked `available: false`; heavy requests degrade to `default_slot` instead of OOM-ing. |
 | **Automatic context budget** | History budget scales with `num_ctx` and shrinks when the current input is long. Long chains stay stable and recall stays accurate. |
+| **Compress before dropping** | When history exceeds the budget, early turns are rolling-summarised (preserving codenames verbatim) instead of being discarded; `context_usage.context_compressed` makes it observable. |
 | **Portable** | No absolute device paths, no GPU indices, no model file names inside `app/`, `run.sh`, `tests/` or `.github/`. |
 
 ### Architecture
@@ -214,6 +215,7 @@ You may use, modify and redistribute this project, including commercially, provi
 | **进度可观测** | 用户问进度时附加来自 SQLite 的真实任务状态，而不是模型编造。 |
 | **显存自动阈值** | `vram_plan` 按启动期可见 GPU 判断；装不下的槽位标 `available: false`，heavy 自动降级到 `default_slot`，不强行加载导致 OOM。 |
 | **上下文自动预算** | 历史预算随 `num_ctx` 伸缩，当前输入变长时自动收紧，保证长链路稳定与召回准确。 |
+| **先压缩再丢弃** | 历史超预算时，把早期轮次滚动摘要保留（暗号逐字保留），而不是直接丢弃；`context_usage.context_compressed` 可观测。 |
 | **可移植** | `app/`、`run.sh`、`tests/`、`.github/` 内无设备绝对路径、无显卡索引、无模型文件名硬编码。 |
 
 ### 架构

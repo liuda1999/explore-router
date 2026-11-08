@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import config, gpu, openai_api, prompts, store
+from . import compaction, config, gpu, openai_api, prompts, store
 from .embed import EmbeddingProvider
 from .llama import LlamaServer
 from .router import SlotManager, classify, slot_for_tier
@@ -222,6 +222,7 @@ def _explore_meta(result):
         "degraded": result["degraded"],
         "history_truncated": result["history_truncated"],
         "history_messages": result["context_usage"].get("history_messages", 0),
+        "context_compressed": result["context_usage"].get("context_compressed", False),
         "finish_reason": result.get("finish_reason"),
         "num_ctx": config.NUM_CTX,
         "selection_reason": result["reason"],
@@ -230,6 +231,55 @@ def _explore_meta(result):
         meta["fallback"] = "timeout"
         meta["hint"] = "后台仍在运行，可轮询 /task_result?task_id=... 获取完整结果"
     return meta
+
+
+async def _compact(session_id, dropped):
+    """滚动压缩：已有摘要 + 新丢弃的轮次 -> 新摘要。
+
+    不能每次对全量丢弃内容重算——摘要容量固定，新内容会挤掉最早的
+    暗号与约束。这里按 `covered_messages` 只合并新增部分，并要求旧摘要
+    中的事实原样保留。
+
+    返回 `(summary, cached, took_ms)`；失败时 summary 为空串，主链路
+    照常按原逻辑丢弃——压缩是增强，不是新的失败点。
+    """
+    limit = config.COMPACTION_MAX_SUMMARY_CHARS
+    prev = store.get_session_summary(session_id)
+    covered = int(prev["covered_messages"]) if prev else 0
+
+    if prev and len(dropped) == covered:
+        return prev["summary"], True, 0
+    if prev and len(dropped) > covered:
+        new_part = dropped[covered:]
+    else:
+        new_part = dropped          # 历史结构变化（清理/重排）时从头压缩
+
+    if not new_part:
+        return (prev["summary"] if prev else ""), True, 0
+    if not await ensure_front():
+        return "", False, 0
+
+    t0 = time.time()
+    try:
+        if prev and prev["summary"]:
+            prompt = compaction.merge_prompt(prev["summary"], new_part, limit)
+        else:
+            prompt = compaction.build_prompt(new_part, limit)
+        summary = await front.chat(
+            [{"role": "system", "content": compaction.SUMMARIZE_SYSTEM},
+             {"role": "user", "content": prompt}],
+            max_tokens=min(1024, int(limit * 1.5)),
+            temperature=0.1)
+    except Exception as exc:
+        print(f"[compaction] failed: {type(exc).__name__}: {exc}", flush=True)
+        return "", False, 0
+    summary = (summary or "").strip()
+    if not summary:
+        return "", False, 0
+    if len(summary) > limit:
+        summary = summary[: limit - 1] + "…"
+    store.save_session_summary(session_id, summary, len(dropped))
+    return summary, False, round((time.time() - t0) * 1000)
 
 
 async def _wait_task(task_id, timeout_s):
@@ -287,15 +337,47 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
         _remaining,
         max(config.HISTORY_MIN_CHARS,
             int(_remaining * config.HISTORY_BUDGET_RATIO)))
+    dropped = []
     if history_override is None:
-        history, history_truncated = store.get_history(
+        history, dropped, history_truncated = store.get_history_split(
             session_id, max_chars=history_budget,
-            max_messages=config.HISTORY_MAX_MESSAGES, with_meta=True)
+            max_messages=config.HISTORY_MAX_MESSAGES)
     else:
         # 请求自带历史（OpenAI 语义）：用同一套预算裁剪，不读库、不重复累积
-        history, history_truncated = store.trim_history(
+        history, dropped, history_truncated = store.split_history(
             history_override, max_chars=history_budget)
     history_chars = sum(len(m["content"]) for m in history)
+
+    # 先压缩再丢弃：把会被裁掉的早期轮次摘要进 system，保住事实与约束。
+    # 摘要失败或内容太短时退回原行为，不阻塞主链路。
+    summary, compaction_meta = "", {}
+    dropped_chars = sum(len(m["content"]) for m in dropped)
+    if (dropped and config.COMPACTION_ENABLED
+            and dropped_chars >= config.COMPACTION_MIN_DROPPED_CHARS):
+        summary, cached, took_ms = await _compact(session_id, dropped)
+        if summary:
+            compaction_meta = {
+                "cached": cached,
+                "ms": took_ms,
+                "summary_chars": len(summary),
+                "dropped_messages": len(dropped),
+                "dropped_chars": dropped_chars,
+            }
+
+    active = store.active_tasks(session_id)
+
+    system = config.FRONT_SYSTEM
+    if system_extra:
+        system += "\n\n" + system_extra.strip()
+    if summary:
+        system += compaction.note(summary)
+    if history_truncated:
+        system += prompts.HISTORY_TRUNCATED_NOTE
+    if active:
+        desc = "; ".join(
+            f"{a['task_id'][:8]} {a['status']} {a['progress']}%" for a in active)
+        system += f"\n当前后台任务：{desc}。用户若问进度，据实简要说明，不要编造结果。"
+
     context_usage = {
         "num_ctx": config.NUM_CTX,
         "input_chars": len(text),
@@ -303,23 +385,16 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
         "history_messages": len(history),
         "history_budget_chars": history_budget,
         "history_truncated": history_truncated,
+        "context_compressed": bool(compaction_meta),
+        "summary_chars": compaction_meta.get("summary_chars", 0),
+        "compaction": compaction_meta,
         "front_max_tokens": config.FRONT_MAX_TOKENS,
+        # 用实际 system 长度（含摘要）估算，避免压缩后仍按旧长度算
         "estimated_total_chars": (len(text) + history_chars
                                   + config.FRONT_MAX_TOKENS
-                                  + len(config.FRONT_SYSTEM)
+                                  + len(system)
                                   + config.CONTEXT_SAFETY_TOKENS),
     }
-    active = store.active_tasks(session_id)
-
-    system = config.FRONT_SYSTEM
-    if system_extra:
-        system += "\n\n" + system_extra.strip()
-    if history_truncated:
-        system += prompts.HISTORY_TRUNCATED_NOTE
-    if active:
-        desc = "; ".join(
-            f"{a['task_id'][:8]} {a['status']} {a['progress']}%" for a in active)
-        system += f"\n当前后台任务：{desc}。用户若问进度，据实简要说明，不要编造结果。"
 
     # 进度提问时才附真实状态；弱进度词要求确实有进行中的任务，避免误伤正常提问
     lowered = text.lower()

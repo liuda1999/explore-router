@@ -159,7 +159,7 @@ def scan_logs(before):
 
 
 # ── A. 长上下文多轮（/chat）─────────────────────────────────────
-def scenario_a():
+def scenario_a(comp_limit=800):
     cat = "A-长上下文"
     sid = f"acc-a-{rand4().lower()}"
     markers = []
@@ -197,12 +197,18 @@ def scenario_a():
         else:
             reply = (d.get("instant_reply") or "")
             record(cat, "长上下文期间至少截断一次", trunc_seen, trunc_seen)
+            record(cat, "已触发上下文压缩", bool(ctx.get("context_compressed")),
+                   ctx.get("context_compressed"))
+            record(cat, "摘要长度在配置上限内",
+                   0 < ctx.get("summary_chars", 0) <= comp_limit,
+                   ctx.get("summary_chars"))
             hit = markers[0] in reply
+            record(cat, "压缩后仍能召回第一轮标记", hit, repr(reply[:60]))
             print(f"      turn6: {took}s, hist={ctx.get('history_chars')}字/"
                   f"{ctx.get('history_messages')}条, "
-                  f"truncated={ctx.get('history_truncated')}, A1_recall={hit}")
-            RESULTS.append({"category": cat, "check": "末轮早期召回（仅记录，不判失败）",
-                            "ok": True, "detail": f"A1_recall={hit}, reply={reply[:40]}"})
+                  f"truncated={ctx.get('history_truncated')}, "
+                  f"compressed={ctx.get('context_compressed')}, "
+                  f"summary={ctx.get('summary_chars')}, A1_recall={hit}")
     return sid
 
 
@@ -434,8 +440,8 @@ def main():
         return not selected or key in selected
 
     if want("a"):
-        print("=== A 长上下文多轮（/chat，5 轮 × 约 2.9K 字 + 追问）===")
-        scenario_a()
+        print("=== A 长上下文多轮（/chat，5 轮 × 约 3.5K 字 + 追问）===")
+        scenario_a((cfg.get("compaction") or {}).get("max_summary_chars", 800))
     if want("b"):
         print("\n=== B Responses 续接（4 轮 × 约 1.8K 字）===")
         scenario_b()
