@@ -137,6 +137,20 @@ def main():
            and direct["usage"].get("total_tokens", 0) > 0, direct.get("usage"))
     record("direct 延迟 < 60s", direct_ms < 60000, f"{direct_ms}ms")
 
+    # 2.1) 截断可见性：短输入要求超长输出，必然撞前台 max_tokens
+    status, trunc = http_json("/v1/chat/completions", {
+        "model": "explore",
+        "messages": [{"role": "user",
+                      "content": "请写不少于800字，分8个小节说明显存预算"}],
+    })
+    ch_t = (trunc.get("choices") or [{}])[0]
+    record("截断时 finish_reason=length",
+           status == 200 and ch_t.get("finish_reason") == "length",
+           (status, ch_t.get("finish_reason")))
+    record("截断时仍返回部分内容",
+           bool((ch_t.get("message") or {}).get("content", "").strip()),
+           len((ch_t.get("message") or {}).get("content") or ""))
+
     # 3) instant：复杂任务只回即时回复，task_id 可轮询
     long_text = ("请详细分析并给出完整方案：本地模型路由需要在显存、上下文长度、"
                  "响应速度与结果质量之间取得平衡。" * 6)

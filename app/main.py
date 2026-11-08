@@ -109,6 +109,7 @@ async def process_task(task_id):
                         f"{'；输入已截断' if truncated else ''}")
         store.update_task(task_id, status="completed", progress=100,
                           final_reply=reply, prefill_ms=prefill_ms,
+                          finish_reason=server.last_finish_reason or "stop",
                           release_info=release_text)
         # 结果已交付；历史补写失败只记录，绝不把 completed 回退成 failed
         try:
@@ -182,7 +183,8 @@ class ChatRequest(BaseModel):
 
 
 def _base_resp(text, session_id, task_id, tier, mode, instant, reason, status,
-               base_url, queue_position=None, context=None, final_text=None):
+               base_url, queue_position=None, context=None, final_text=None,
+               finish_reason=None):
     return {
         "code": 200,
         "user_input": text,
@@ -194,6 +196,8 @@ def _base_resp(text, session_id, task_id, tier, mode, instant, reason, status,
         # 与 /task_result 的 final_reply 对齐：只放干净结果，不含进度附注
         "最终回复": final_text if final_text is not None else "",
         "task_status": status,
+        # stop = 正常结束；length = 撞到 max_tokens，内容被截断
+        "finish_reason": finish_reason,
         "status": "success",
         "num_ctx": config.NUM_CTX,
         "selection_reason": reason,
@@ -218,6 +222,7 @@ def _explore_meta(result):
         "degraded": result["degraded"],
         "history_truncated": result["history_truncated"],
         "history_messages": result["context_usage"].get("history_messages", 0),
+        "finish_reason": result.get("finish_reason"),
         "num_ctx": config.NUM_CTX,
         "selection_reason": result["reason"],
     }
@@ -333,11 +338,14 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
         {"role": "user", "content": text}]
 
     clean_instant = ""
+    front_finish = "stop"
     try:
         if not await ensure_front():
             raise RuntimeError("前台模型不可用且处于重启冷却期")
         clean_instant = await front.chat(messages, max_tokens=config.FRONT_MAX_TOKENS,
                                          temperature=0.4)
+        # 前台同样会撞 max_tokens；停止原因必须透传，否则半句话会被当成完整回答
+        front_finish = front.last_finish_reason or "stop"
     except Exception as exc:
         clean_instant = prompts.front_failure(exc)
     instant = clean_instant.rstrip() + progress_note if progress_note else clean_instant
@@ -350,7 +358,7 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
     if not needs_backend:
         store.create_task(task_id, session_id, text, tier, clean_instant, reason)
         store.update_task(task_id, status="completed", progress=100,
-                          final_reply=clean_instant,
+                          final_reply=clean_instant, finish_reason=front_finish,
                           release_info="简单任务由前台槽位直接完成")
         return {
             "text": text, "session_id": session_id, "task_id": task_id,
@@ -359,7 +367,7 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
             "queue_position": None, "context_usage": context_usage,
             "degraded": degraded, "slot_key": slot_key,
             "history_chars": history_chars, "history_truncated": history_truncated,
-            "timed_out": False, "error": "",
+            "timed_out": False, "error": "", "finish_reason": front_finish,
         }
 
     store.create_task(task_id, session_id, text, tier, clean_instant, reason)
@@ -371,12 +379,14 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
     queue_position = max(0, queue.qsize() - 1)
 
     final, status, timed_out, error = "", "pending", False, ""
+    finish_reason = None
     if wait_timeout_s:
         task, timed_out = await _wait_task(task_id, wait_timeout_s)
         if task:
             status = task["status"]
             final = task["final_reply"] or ""
             error = task["error_msg"] or ""
+            finish_reason = task["finish_reason"]
     return {
         "text": text, "session_id": session_id, "task_id": task_id,
         "tier": tier, "reason": reason, "mode": "async",
@@ -385,6 +395,7 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
         "degraded": degraded, "slot_key": slot_key,
         "history_chars": history_chars, "history_truncated": history_truncated,
         "timed_out": timed_out, "error": error,
+        "finish_reason": finish_reason or (front_finish if final else None),
     }
 
 
@@ -398,7 +409,8 @@ async def chat(req: ChatRequest, request: Request):
         result["text"], result["session_id"], result["task_id"], result["tier"],
         result["mode"], result["instant"], result["reason"], result["status"],
         base_url, queue_position=result["queue_position"],
-        context=result["context_usage"], final_text=result["final"]))
+        context=result["context_usage"], final_text=result["final"],
+        finish_reason=result.get("finish_reason")))
 
 
 @app.get("/task_result")
@@ -422,6 +434,7 @@ async def task_result(task_id: str = Query(...)):
         "error_msg": t["error_msg"] or "",
         "prefill_ms": t["prefill_ms"],
         "num_ctx": t["num_ctx"],
+        "finish_reason": t["finish_reason"],
         "status": "success",
         "message": {
             "pending": "任务排队中，等待后台槽位",
@@ -484,9 +497,10 @@ async def _stream_completion(parsed, result, req_id, created):
             req_id, created, model, {"content": piece}))
 
     written = len(instant)
+    task = None
     if result["mode"] == "async" and result["status"] in ("pending", "processing"):
         deadline = time.time() + config.OPENAI_WAIT_TIMEOUT_S
-        task, ticks = None, 0
+        ticks = 0
         while time.time() < deadline:
             task = store.get_task(result["task_id"])
             if task and task["status"] in ("completed", "failed"):
@@ -510,8 +524,15 @@ async def _stream_completion(parsed, result, req_id, created):
                     req_id, created, model, {"content": piece}))
             written += len(note)
 
+    finish = "stop"
+    if task and task.get("finish_reason"):
+        finish = task["finish_reason"]
+    elif result.get("finish_reason"):
+        finish = result["finish_reason"]
+    if finish not in ("stop", "length"):
+        finish = "stop"
     yield openai_api.sse(openai_api.chunk_payload(
-        req_id, created, model, {}, finish_reason="stop"))
+        req_id, created, model, {}, finish_reason=finish))
     if parsed["include_usage"]:
         yield openai_api.sse(openai_api.chunk_payload(
             req_id, created, model,
@@ -586,8 +607,11 @@ async def openai_chat_completions(request: Request):
     else:
         content = result["instant"]
 
+    finish = result.get("finish_reason") or "stop"
+    if finish not in ("stop", "length", "content_filter"):
+        finish = "stop"
     return JSONResponse(openai_api.completion_payload(
-        req_id, created, parsed["model"], content, "stop",
+        req_id, created, parsed["model"], content, finish,
         openai_api.estimate_usage(
             len(result["text"]) + result["history_chars"], len(content)),
         _explore_meta(result)))
@@ -637,10 +661,11 @@ async def _stream_response(parsed, result, resp_id, msg_id, created):
                     output_index=0, content_index=0, delta=piece)
     written = len(instant)
     final_text = instant
+    task = None
 
     if result["mode"] == "async" and result["status"] in ("pending", "processing"):
         deadline = time.time() + config.OPENAI_WAIT_TIMEOUT_S
-        task, ticks = None, 0
+        ticks = 0
         while time.time() < deadline:
             task = store.get_task(result["task_id"])
             if task and task["status"] in ("completed", "failed"):
@@ -674,12 +699,20 @@ async def _stream_response(parsed, result, resp_id, msg_id, created):
     yield frame("response.content_part.done", item_id=msg_id, output_index=0,
                 content_index=0, part=part)
     yield frame("response.output_item.done", output_index=0, item=full_item)
-    yield frame("response.completed",
-                response=base_response("completed", final_text, usage,
-                                       [full_item]))
+    finish = "stop"
+    if task and task.get("finish_reason"):
+        finish = task["finish_reason"]
+    elif result.get("finish_reason"):
+        finish = result["finish_reason"]
+    final_status = "incomplete" if finish == "length" else "completed"
+    incomplete_reason = "max_output_tokens" if finish == "length" else None
+    event = ("response.incomplete" if final_status == "incomplete"
+             else "response.completed")
+    yield frame(event, response=base_response(final_status, final_text, usage,
+                                              [full_item], incomplete_reason))
     if parsed["store"]:
         store.save_response(resp_id, result["session_id"], result["task_id"],
-                            model, result["text"], final_text, "completed")
+                            model, result["text"], final_text, final_status)
 
 
 @app.post("/v1/responses")
@@ -766,6 +799,9 @@ async def openai_responses(request: Request):
     if result["timed_out"]:
         # 后台仍在跑：不谎称完成，用 incomplete + timeout 表明可续查
         status, incomplete = "incomplete", "timeout"
+    elif (result.get("finish_reason") == "length"):
+        # 撞到 max_tokens：内容确实被截断，不能报 completed
+        status, incomplete = "incomplete", "max_output_tokens"
     usage = openai_api.response_usage(
         len(result["text"]) + result["history_chars"], len(content))
     payload = openai_api.response_payload(

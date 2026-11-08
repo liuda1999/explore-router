@@ -147,6 +147,20 @@ def main():
                fin_text == (own.get("final_reply") or ""),
                f"{len(fin_text)} vs {len(own.get('final_reply') or '')}")
 
+    # 2.1) 截断可见性：撞 max_tokens 时必须报 incomplete，不能谎称 completed
+    status, trunc = http_json("/v1/responses", {
+        "model": "explore",
+        "input": "请写不少于800字，分8个小节说明显存预算"})
+    record("截断时 status=incomplete",
+           status == 200 and trunc.get("status") == "incomplete",
+           (status, trunc.get("status")))
+    record("截断原因 max_output_tokens",
+           (trunc.get("incomplete_details") or {}).get("reason") == "max_output_tokens",
+           trunc.get("incomplete_details"))
+    record("截断时 explore.finish_reason=length",
+           (trunc.get("explore") or {}).get("finish_reason") == "length",
+           (trunc.get("explore") or {}).get("finish_reason"))
+
     # 3) instant：立即返回 + task_id
     status, inst = http_json("/v1/responses", {
         "model": "explore-fast",

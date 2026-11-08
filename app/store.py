@@ -43,6 +43,7 @@ def init():
             selection_reason TEXT,
             prefill_ms REAL,
             num_ctx INTEGER,
+            finish_reason TEXT,
             created_at REAL,
             updated_at REAL
         )""")
@@ -55,6 +56,11 @@ def init():
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id, id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_task_session ON tasks(session_id, status)")
+        # 轻量迁移：旧库补 finish_reason 列（只 ADD COLUMN，不改旧列、不动数据）。
+        # 目的：让 max_tokens 截断（length）对调用方可观测。
+        task_cols = {row[1] for row in c.execute("PRAGMA table_info(tasks)")}
+        if "finish_reason" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN finish_reason TEXT")
         # Responses API：previous_response_id 续接与 GET 检索。
         # 独立新表，只 CREATE IF NOT EXISTS，不对旧表做 ALTER。
         c.execute("""CREATE TABLE IF NOT EXISTS responses (

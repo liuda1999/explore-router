@@ -178,7 +178,7 @@ Audited on real hardware with real models, real process crashes and real restart
 
 ### Current boundaries
 
-No authentication, no rate limiting, no automatic log/database rotation — the API binds to `127.0.0.1` and expects a reverse proxy with auth if exposed. SSE is chunked rather than token-by-token, because the upstream `llama-server` call is non-streaming. AMD ROCm is validated at the config/parse layer but not yet on physical AMD hardware. Details in [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md), section "Known limitations".
+No authentication, no rate limiting, no automatic log/database rotation — the API binds to `127.0.0.1` and expects a reverse proxy with auth if exposed. SSE is chunked rather than token-by-token, because the upstream `llama-server` call is non-streaming. When output hits `max_tokens`, responses report `finish_reason=length` (`/v1/responses` reports `status=incomplete`). AMD ROCm is validated at the config/parse layer but not yet on physical AMD hardware. Details in [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md), section "Known limitations".
 
 ### License
 
@@ -355,7 +355,7 @@ curl -s -X POST http://127.0.0.1:8100/v1/responses \
 
 ### 当前边界
 
-无鉴权、无速率限制、无日志/数据库自动轮转——默认绑定 `127.0.0.1`，对外暴露必须加反向代理与鉴权。SSE 为分块发送而非逐 token 流式（底层 `llama-server` 调用非流式）。AMD ROCm 已完成代码与配置解析层验证，尚未在 AMD 真机上实测。详见 [PROJECT_INTRO.md](PROJECT_INTRO.md)「已知限制」。
+无鉴权、无速率限制、无日志/数据库自动轮转——默认绑定 `127.0.0.1`，对外暴露必须加反向代理与鉴权。SSE 为分块发送而非逐 token 流式（底层 `llama-server` 调用非流式）。输出撞到 `max_tokens` 时返回 `finish_reason=length`（`/v1/responses` 返回 `status=incomplete`）。AMD ROCm 已完成代码与配置解析层验证，尚未在 AMD 真机上实测。详见 [PROJECT_INTRO.md](PROJECT_INTRO.md)「已知限制」。
 
 ### 许可证
 

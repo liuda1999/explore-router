@@ -268,7 +268,13 @@ def scenario_c():
                task.get("task_status") == "completed", task.get("task_status"))
         record(cat, f"第{i}篇长度 300-1800",
                300 <= len(text) <= 1800, len(text))
-        print(f"      article{i}: {len(text)}字, slot={task.get('chosen_model')}")
+        record(cat, f"第{i}篇未被 max_tokens 截断",
+               task.get("finish_reason") != "length", task.get("finish_reason"))
+        record(cat, f"第{i}篇结尾完整",
+               bool(text.strip()) and text.rstrip()[-1] in "。！？.!?）)",
+               repr(text.rstrip()[-16:]))
+        print(f"      article{i}: {len(text)}字, slot={task.get('chosen_model')}, "
+              f"finish={task.get('finish_reason')}")
     return
 
 
@@ -348,33 +354,44 @@ def scenario_e():
 # ── F. 流式长文本 ───────────────────────────────────────────
 def scenario_f():
     cat = "F-流式"
+    # 长输入 -> 后台档（max_output_tokens=1024），确保 400 字不会被前台 256 截断
+    long_req = ("请详细分析并给出完整方案：本地推理的显存预算应该如何规划？"
+                + "需要同时考虑量化精度、上下文长度、并发请求与突发负载。" * 6)
     frames, raw, ctype = http_sse("/v1/chat/completions", {
         "model": "explore", "stream": True,
-        "messages": [{"role": "user",
-                      "content": "请用大约 400 字说明本地推理的显存规划，分点展开。"}]})
+        "messages": [{"role": "user", "content": long_req}]})
     text = "".join((f.get("choices") or [{}])[0].get("delta", {}).get("content", "")
                    for f in frames if f.get("choices"))
+    finishes = [(f.get("choices") or [{}])[0].get("finish_reason")
+                for f in frames if f.get("choices")]
     record(cat, "chat SSE 有 [DONE]", any(f.get("done") for f in frames))
-    record(cat, "chat SSE 拼接收尾 finish_reason=stop",
-           any((f.get("choices") or [{}])[0].get("finish_reason") == "stop"
-               for f in frames if f.get("choices")))
+    record(cat, "chat SSE 收尾 finish_reason 非 length",
+           "length" not in finishes, finishes[-2:])
     record(cat, "chat SSE 文本长度 >= 200", len(text) >= 200, len(text))
+    record(cat, "chat SSE 结尾完整",
+           bool(text.strip()) and text.rstrip()[-1] in "。！？.!?）)",
+           repr(text.rstrip()[-16:]))
 
     frames2, raw2, ctype2 = http_sse("/v1/responses", {
-        "model": "explore", "stream": True,
-        "input": "请用大约 400 字说明上下文预算，分点展开。"})
+        "model": "explore", "stream": True, "input": long_req})
     names = [f.get("_event") for f in frames2]
     deltas = "".join(f.get("delta") or "" for f in frames2
                      if f.get("_event") == "response.output_text.delta")
     done_text = next((f.get("text") for f in frames2
                       if f.get("_event") == "response.output_text.done"), "")
-    record(cat, "responses SSE 以 completed 结束",
-           "response.completed" in names, names[-3:])
+    record(cat, "responses SSE 正常收尾（completed/incomplete）",
+           any(n in ("response.completed", "response.incomplete") for n in names),
+           names[-2:])
+    record(cat, "responses SSE 未截断",
+           "response.incomplete" not in names, names[-2:])
     record(cat, "responses SSE 无 [DONE]",
            not any(l.strip() == "data: [DONE]" for l in raw2), raw2[-2:])
     record(cat, "responses SSE done 与 delta 一致",
            done_text == deltas, f"{len(done_text)} vs {len(deltas)}")
     record(cat, "responses SSE 文本长度 >= 200", len(deltas) >= 200, len(deltas))
+    record(cat, "responses SSE 结尾完整",
+           bool(deltas.strip()) and deltas.rstrip()[-1] in "。！？.!?）)",
+           repr(deltas.rstrip()[-16:]))
 
 
 # ── G. 边界错误 ─────────────────────────────────────────────

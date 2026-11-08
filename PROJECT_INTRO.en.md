@@ -319,6 +319,8 @@ Precedence: `explore_mode` > `X-Explore-Mode` > model suffix > `openai.default_m
 
 **Trade-offs**: `temperature` / `max_tokens` are echoed but not applied — sampling is controlled server-side by configuration. `usage` is estimated from character counts (roughly 1 token per 1.5 CJK characters), not exact tokenizer output.
 
+**Truncation is visible**: `finish_reason` comes straight from the model; `length` means the `max_tokens` cap was hit (front model: `frontend.max_tokens`, default 256). `/chat`, `/v1/chat/completions` and `/task_result` all return it; `/v1/responses` reports `status="incomplete"` with `incomplete_details.reason="max_output_tokens"` and **never claims completion**. This was a real gap found during acceptance testing: the front model used to report `stop` after hitting 256 tokens, so clients treated a half sentence as a complete answer.
+
 ### 11.2 Responses API
 
 `POST /v1/responses` is OpenAI's newer protocol. It is a **structural** difference from chat/completions, not an alias:

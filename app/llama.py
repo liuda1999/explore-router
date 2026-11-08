@@ -27,6 +27,9 @@ class LlamaServer:
         self.load_ms = None
         self.last_error = ""
         self.last_timings = {}
+        # 生成结束原因：stop / length。length 表示被 max_tokens 截断，
+        # 必须透传给调用方，否则客户端会把半句话当成完整回答。
+        self.last_finish_reason = None
         self._log = None
 
     @property
@@ -160,7 +163,9 @@ class LlamaServer:
                     if r.status_code == 200:
                         data = r.json()
                         self.last_timings = data.get("timings") or {}
-                        msg = (data.get("choices") or [{}])[0].get("message", {})
+                        choice = (data.get("choices") or [{}])[0]
+                        self.last_finish_reason = choice.get("finish_reason")
+                        msg = choice.get("message", {})
                         content = (msg.get("content") or "").strip()
                         if content:
                             return content
@@ -190,6 +195,9 @@ class LlamaServer:
             r.raise_for_status()
             data = r.json()
             self.last_timings = data.get("timings") or self.last_timings
+            # /completion 用 stopped_limit 表示触顶；没有该字段时按正常结束
+            self.last_finish_reason = ("length" if data.get("stopped_limit")
+                                       else "stop")
             content = (data.get("content") or "").strip()
             if content:
                 return content

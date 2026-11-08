@@ -319,6 +319,8 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 
 **取舍**：`temperature` / `max_tokens` 只回显不生效，采样由服务端配置统一控制；`usage` 是按字符数估算的近似值（中文约 1 token / 1.5 字），不是 tokenizer 精确计数。
 
+**截断可见**：`finish_reason` 直接来自模型，`length` 表示撞到 `max_tokens`（前台由 `frontend.max_tokens` 控制，默认 256）。`/chat`、`/v1/chat/completions`、`/task_result` 都返回该字段；`/v1/responses` 遇 `length` 时返回 `status="incomplete"` + `incomplete_details.reason="max_output_tokens"`，**不会谎称完成**。这是一次实测发现的缺口：此前前台撞 256 token 后仍报 `stop`，客户端会把半句话当成完整回答。
+
 ### 11.2 Responses API
 
 `POST /v1/responses` 是 OpenAI 的新协议，与 chat/completions 是**结构性差异**，不是简单别名：
