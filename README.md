@@ -158,7 +158,7 @@ Stop cleanly (only this project's PID and configured ports are touched):
 
 ### Verified status
 
-Audited on real hardware with real models, real process crashes and real restarts — **no mocks**: API contract 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long-context 15/15 per context tier, 32K/64K/96K matrix 69/69, single-GPU degradation verified, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md). All performance figures there are **device-specific historical measurements**, not project limits.
+Audited on real hardware with real models, real process crashes and real restarts — **no mocks**: API contract 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long-context 15/15 per context tier, 32K/64K/96K matrix 69/69, OpenAI compatibility **38/38** (chat/completions) and **41/41** (Responses), pre-release acceptance **91/91**, single-GPU degradation verified, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md) and [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md). All performance figures there are **device-specific historical measurements**, not project limits.
 
 ### Documentation
 
@@ -335,7 +335,7 @@ curl -s -X POST http://127.0.0.1:8100/v1/responses \
 
 ### 验证状态
 
-真机、真模型、真实进程故障与真实重启审计，**全程不使用 mock**：API 契约 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、单卡降级已验证、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。其中所有性能数字都是**特定设备的历史实测**，不是项目约束或能力边界。
+真机、真模型、真实进程故障与真实重启审计，**全程不使用 mock**：API 契约 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 **38/38**（chat/completions）与 **41/41**（Responses）、发布前验收压测 **91/91**、单卡降级已验证、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。其中所有性能数字都是**特定设备的历史实测**，不是项目约束或能力边界。
 
 ### 文档索引
 

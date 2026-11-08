@@ -356,15 +356,17 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 
 **原则：真机、真模型、真实进程故障、真实重启，不使用 mock / 模拟数据。**
 
-| 层次 | 内容 | 入口 |
+| 层 | 内容 | 入口 |
 |---|---|---|
 | 静态层（任意机器，无需 GPU） | Python/Shell 语法、配置解析与 fail-fast、可移植性（无设备/模型硬编码）、文档一致性、ruff | `bash tests/ci_static.sh` |
 | GPU 集成层（自托管 GPU runner） | 基础链路、槽位切换、稳定性、上下文矩阵、长上下文召回、故障注入、重启恢复、单卡阈值 | `bash tests/ci_integration.sh` |
+| OpenAI 兼容层 | chat/completions 38 项、Responses 41 项（含 `finish_reason` 截断可见性、`previous_response_id` 续接） | `python3 tests/test_openai_api.py` / `tests/test_responses_api.py` |
+| 发布前验收压测 | 长上下文多轮、Responses 续接、连续长文本、三协议一致性、并发队列、两套 SSE、边界错误、日志扫描 | `python3 tests/audit_acceptance.py` |
 | 全量审计 | API 契约、并发、内容正确性、真实 SIGKILL、真实重启 | `BASE=http://127.0.0.1:8100 ./tests/audit_runner.sh` |
 
 GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：`static` 跑在 `ubuntu-latest`；`integration` 跑在带 `gpu` 标签的 self-hosted runner，使用独立端口与数据目录，结束自动停服，不与生产实例共用端口。把仓库变量 `ENABLE_GPU_CI` 设为 `true` 后，push 到 `main` 才会自动触发集成层（避免公开仓库里长期挂一个排队中的 job）；手动 `workflow_dispatch` 总是执行，详见 [DEPLOYMENT.md](DEPLOYMENT.md) 第 9 节。
 
-已实测通过：API 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、单卡（20G）降级链路、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md)。
+已实测通过：API 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 38/38 + 41/41、发布前验收压测 91/91、单卡（20G）降级链路、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。
 
 ---
 
