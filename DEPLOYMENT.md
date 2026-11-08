@@ -197,6 +197,11 @@ curl -s http://127.0.0.1:8100/v1/models
 curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"explore","messages":[{"role":"user","content":"2+2 等于几"}]}'
+
+# Responses API：应返回 object=response 且 output[0].content[0].type=output_text
+curl -s -X POST http://127.0.0.1:8100/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","input":"2+2 等于几"}'
 ```
 
 **验收清单 / Acceptance checklist**
@@ -212,7 +217,7 @@ curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
 | 7 | 复杂任务 | `process_mode=async`，`final_reply` 非空且为后台原始输出 |
 | 8 | 进度提问 | 返回 `[后台任务进度]` 真实状态 |
 | 9 | `/chat` 的 `context_usage` | `estimated_total_chars <= num_ctx` |
-| 10 | `/v1/models` 与 `/v1/chat/completions` | 返回 `explore` 等虚拟模型名；`object=chat.completion`，`content` 非空，`explore.task_id` 可查 |
+| 10 | `/v1/models`、`/v1/chat/completions`、`/v1/responses` | 返回 `explore` 等虚拟模型名；`object=chat.completion` / `response`，正文非空，`explore.task_id` 可查 |
 | 11 | 停止后 | `./run.sh status` 显示 not running；本项目端口释放 |
 
 ### Step 8 · 回归测试

@@ -55,6 +55,20 @@ def init():
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id, id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_task_session ON tasks(session_id, status)")
+        # Responses API：previous_response_id 续接与 GET 检索。
+        # 独立新表，只 CREATE IF NOT EXISTS，不对旧表做 ALTER。
+        c.execute("""CREATE TABLE IF NOT EXISTS responses (
+            response_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            model TEXT,
+            input_text TEXT,
+            output_text TEXT,
+            status TEXT,
+            created_at REAL
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_resp_session "
+                  "ON responses(session_id, created_at)")
 
 
 def reset_inflight():
@@ -129,6 +143,27 @@ def list_tasks(limit=20):
 def task_count():
     with _lock, _db() as c:
         return int(c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+
+
+def save_response(response_id, session_id, task_id, model,
+                  input_text, output_text, status):
+    """记录一次 Responses API 的输入输出，供 previous_response_id 与 GET 检索。
+
+    同一 response_id 重复写入时覆盖（重试场景），不产生重复行。
+    """
+    with _lock, _db() as c:
+        c.execute("""INSERT OR REPLACE INTO responses
+            (response_id, session_id, task_id, model, input_text, output_text,
+             status, created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                  (response_id, session_id, task_id, model, input_text,
+                   output_text, status, time.time()))
+
+
+def get_response(response_id):
+    with _lock, _db() as c:
+        row = c.execute("SELECT * FROM responses WHERE response_id=?",
+                        (response_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def append_message(session_id, role, content):

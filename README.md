@@ -136,6 +136,16 @@ curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
 curl -sN -X POST http://127.0.0.1:8100/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"explore","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
+
+# Responses API (newer OpenAI protocol): input / output[] / previous_response_id
+curl -s -X POST http://127.0.0.1:8100/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","input":"What is 2+2?"}'
+
+# multi-turn through server-side state
+curl -s -X POST http://127.0.0.1:8100/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","input":"And the previous answer times 2?","previous_response_id":"resp_..."}'
 ```
 
 Stop cleanly (only this project's PID and configured ports are touched):
@@ -302,6 +312,16 @@ curl -s -X POST http://127.0.0.1:8100/v1/chat/completions \
 curl -sN -X POST http://127.0.0.1:8100/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"explore","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+
+# Responses API（OpenAI 新协议）：input / output[] / previous_response_id
+curl -s -X POST http://127.0.0.1:8100/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","input":"2+2 等于几"}'
+
+# 多轮：用 previous_response_id 续接服务端会话
+curl -s -X POST http://127.0.0.1:8100/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"explore","input":"刚才的结果乘以 2 是多少","previous_response_id":"resp_..."}'
 ```
 
 停止（只处理本项目 PID 与配置中的端口，不做全局清理）：

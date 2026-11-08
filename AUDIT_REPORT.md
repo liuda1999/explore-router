@@ -383,3 +383,55 @@ PYTHONPATH=$PWD/pylib:$PWD python3 tests/test_openai_api.py
 # 结果写入 logs/openai_api_test.json，含逐项 check 与 passed/total
 PYTHONPATH=$PWD/pylib:$PWD python3 tests/test_smoke.py   # /chat 回归
 ```
+
+---
+
+## 14. 补充：Responses API 真机测试（2026-11-08 18:52–19:00）
+
+### 14.1 变更范围
+
+新增 `POST /v1/responses` 与 `GET /v1/responses/{id}`：支持 `input`（字符串或消息数组）、`instructions`、`store`、`previous_response_id`、细分 SSE 事件（`event:` + `data:`，无 `[DONE]`）。`/v1/chat/completions` 与 `/chat` 未改动，三条入口共用 `_pipeline()`。
+
+### 14.2 结果：38/38 通过
+
+| 组 | 覆盖 | 结果 |
+|---|---|---|
+| 非流式 direct | `object=response`、`status=completed`、`output[0]` 为 message + output_text、`process_mode=direct`、usage 字段 | 7/7 |
+| final | `status=completed`、`process_mode=async`、tier 命中、正文与自身 task 的 `final_reply` 逐字一致 | 6/6 |
+| instant | 立即返回、给出 `task_id`、后台任务最终 `completed` | 5/5 |
+| 流式 | 有 `event:` 行、以 `response.created` 开头、delta→done→completed 顺序、拼接非空、无 `[DONE]` | 8/8 |
+| previous_response_id | 第一轮返回 `resp_` id、第二轮 `history_messages>=2`、召回暗号 `RESP-7Q2K` | 5/5 |
+| GET 检索 | `200` 且内容与首次返回逐字一致 | 2/2 |
+| store=false | 请求成功、事后 GET 返回 `404` | 2/2 |
+| 错误路径 | 空 `input` → `400`；未知 `previous_response_id` → `404` + `previous_response_not_found` | 2/2 |
+| 合计 | | **38/38** |
+
+### 14.3 回归
+
+- `/v1/chat/completions`：**36/36**（上一轮全套，未受影响）。
+- `/chat`：`test_smoke.py` **11/11**，`all_pass: true`。
+- 旧库兼容：`responses` 表在既有 `data/state.db` 上通过 `CREATE TABLE IF NOT EXISTS` 创建，`messages` / `tasks` 未受影响；重复 `init()` 幂等。
+
+### 14.4 关键验证
+
+- 流式 `response.output_text.done` 的文本与所有 delta 拼接**完全一致**，且流**不以 `[DONE]` 结尾**——这是 Responses 与 chat/completions 最容易做错的一处。
+- `previous_response_id` 续接确实带上了服务端历史（`explore.history_messages=2`），3B 前台在第二轮正确召回 `RESP-7Q2K`。
+- `store=false` 的请求不写入 `responses` 表，事后按 id 检索返回 `404`，语义与 OpenAI 一致。
+
+### 14.5 超时语义（设计，未单独计时）
+
+Responses 复用第 13.4 节的同一套等待逻辑（`openai.wait_timeout_s`）。超时分支返回 `status="incomplete"` + `incomplete_details.reason="timeout"`，并保留 `explore.task_id`，**不会谎称 `completed`**。本次未对该分支单独做秒级计时验证。
+
+### 14.6 明确未实现
+
+工具调用（`tools` / `tool_choice`）、结构化输出（`text.format`）、`reasoning`、`truncation`、`background` 模式、`input_image` / `input_file` 等非文本模态。字段会被接受但不生效，或按纯文本处理。
+
+### 14.7 复现
+
+```bash
+cd <工作区>
+PYTHONPATH=$PWD/pylib:$PWD python3 tests/test_responses_api.py
+# 结果写入 logs/responses_api_test.json
+PYTHONPATH=$PWD/pylib:$PWD python3 tests/test_openai_api.py   # chat/completions 回归
+PYTHONPATH=$PWD/pylib:$PWD python3 tests/test_smoke.py        # /chat 回归
+```

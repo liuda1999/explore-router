@@ -319,6 +319,35 @@ Precedence: `explore_mode` > `X-Explore-Mode` > model suffix > `openai.default_m
 
 **Trade-offs**: `temperature` / `max_tokens` are echoed but not applied — sampling is controlled server-side by configuration. `usage` is estimated from character counts (roughly 1 token per 1.5 CJK characters), not exact tokenizer output.
 
+### 11.2 Responses API
+
+`POST /v1/responses` is OpenAI's newer protocol. It is a **structural** difference from chat/completions, not an alias:
+
+| Dimension | Chat Completions | Responses |
+|---|---|---|
+| Input | `messages[]` | `input` (string or message array) + `instructions` |
+| Output | `choices[].message.content` | `output_text` inside `output[]` |
+| Termination | `finish_reason` | `status` + `incomplete_details` |
+| Multi-turn | Client resends the full `messages` | `previous_response_id` lets the server continue |
+| Streaming | `data:` frames + `[DONE]` | `event:` + `data:` typed events, **no `[DONE]`** |
+
+**What is supported**
+
+- `input` accepts a string or a message array; `content` accepts strings and `input_text` / `output_text` parts. `system` / `developer` messages and `instructions` are merged and appended to the front model's system prompt.
+- `model` mapping is identical to 11.1; `explore-fast` or a `-fast` suffix selects instant mode.
+- `store` defaults to `true`: `response_id → session_id` plus input/output are persisted in a dedicated SQLite table `responses` (`CREATE TABLE IF NOT EXISTS`, no ALTER on existing tables).
+- `previous_response_id` looks up the original session and reads server-side history; an unknown id returns `404` + `previous_response_not_found`.
+- `GET /v1/responses/{id}` returns a stored response; requests sent with `store=false` are not retrievable (`404`).
+- `stream=true` emits the full event sequence `response.created` → `in_progress` → `output_item.added` → `content_part.added` → `output_text.delta`… → `output_text.done` → `content_part.done` → `output_item.done` → `response.completed`, each frame carrying `sequence_number`.
+
+**Trade-offs shared with 11.1**
+
+- `max_output_tokens` / `temperature` are echoed but not applied — sampling is server-configured.
+- `usage` is estimate-based: `input_tokens` / `output_tokens` / `total_tokens`, with `*_details` placeholders.
+- On backend wait timeout the response is `status="incomplete"` with `incomplete_details.reason="timeout"` — it **does not claim `completed`**; `explore.fallback=timeout` is set and the task keeps running.
+
+**Explicitly not implemented**: tool calling (`tools` / `tool_choice`), structured outputs (`text.format`), `reasoning`, `truncation`, `background` mode, and non-text modalities such as `input_image` / `input_file`. Those fields are accepted but inert, or treated as plain text — this covers the text chat path, not the full Responses specification.
+
 ---
 
 ## 12. Quality assurance: tests and CI

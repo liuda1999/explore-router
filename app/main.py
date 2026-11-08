@@ -205,6 +205,28 @@ def _base_resp(text, session_id, task_id, tier, mode, instant, reason, status,
     }
 
 
+def _explore_meta(result):
+    """两条 OpenAI 入口共用的扩展字段，避免两处拼装漂移。"""
+    meta = {
+        "task_id": result["task_id"],
+        "task_status": result["status"],
+        "process_mode": result["mode"],
+        "tier": result["tier"],
+        "chosen_slot": result["slot_key"],
+        "instant_reply": result["instant"],
+        "queue_position": result["queue_position"],
+        "degraded": result["degraded"],
+        "history_truncated": result["history_truncated"],
+        "history_messages": result["context_usage"].get("history_messages", 0),
+        "num_ctx": config.NUM_CTX,
+        "selection_reason": result["reason"],
+    }
+    if result["timed_out"]:
+        meta["fallback"] = "timeout"
+        meta["hint"] = "后台仍在运行，可轮询 /task_result?task_id=... 获取完整结果"
+    return meta
+
+
 async def _wait_task(task_id, timeout_s):
     """轮询后台任务直到完成/失败或超时；返回 (task, timed_out)。"""
     deadline = time.time() + max(0.0, float(timeout_s))
@@ -564,25 +586,221 @@ async def openai_chat_completions(request: Request):
     else:
         content = result["instant"]
 
-    explore = {
-        "task_id": result["task_id"],
-        "task_status": result["status"],
-        "process_mode": result["mode"],
-        "tier": result["tier"],
-        "chosen_slot": result["slot_key"],
-        "instant_reply": result["instant"],
-        "queue_position": result["queue_position"],
-        "degraded": result["degraded"],
-        "history_truncated": result["history_truncated"],
-        "num_ctx": config.NUM_CTX,
-        "selection_reason": result["reason"],
-    }
-    if result["timed_out"]:
-        explore["fallback"] = "timeout"
-        explore["hint"] = "后台仍在运行，可轮询 /task_result?task_id=... 获取完整结果"
-
     return JSONResponse(openai_api.completion_payload(
         req_id, created, parsed["model"], content, "stop",
         openai_api.estimate_usage(
             len(result["text"]) + result["history_chars"], len(content)),
-        explore))
+        _explore_meta(result)))
+
+
+async def _stream_response(parsed, result, resp_id, msg_id, created):
+    """Responses 流式：细分事件 + `event:` 行，**不以 [DONE] 结尾**。
+
+    与 chat/completions 一样先吐即时回复；后台完成后再续写最终结果，
+    客户端看到的仍是一条完整 message。每 10 秒发 SSE 注释行做心跳。
+    """
+    model = parsed["model"]
+    seq = 0
+
+    def frame(event_type, **fields):
+        nonlocal seq
+        body = {"type": event_type, "sequence_number": seq}
+        body.update(fields)
+        seq += 1
+        return openai_api.response_event(event_type, body)
+
+    def base_response(status, text, usage, output, incomplete_reason=None):
+        return openai_api.response_payload(
+            resp_id, created, model, text, status, usage, _explore_meta(result),
+            msg_id,
+            instructions=parsed["instructions"],
+            max_output_tokens=parsed["requested_max_tokens"],
+            temperature=parsed["requested_temperature"],
+            previous_response_id=parsed["previous_response_id"],
+            store=parsed["store"], output=output,
+            incomplete_reason=incomplete_reason)
+
+    created_resp = base_response("in_progress", "", None, [])
+    yield frame("response.created", response=created_resp)
+    yield frame("response.in_progress", response=created_resp)
+
+    pending_item = {"type": "message", "id": msg_id, "status": "in_progress",
+                    "role": "assistant", "content": []}
+    yield frame("response.output_item.added", output_index=0, item=pending_item)
+    yield frame("response.content_part.added", item_id=msg_id, output_index=0,
+                content_index=0,
+                part={"type": "output_text", "text": "", "annotations": []})
+
+    instant = result["instant"] or ""
+    for piece in openai_api.split_text(instant):
+        yield frame("response.output_text.delta", item_id=msg_id,
+                    output_index=0, content_index=0, delta=piece)
+    written = len(instant)
+    final_text = instant
+
+    if result["mode"] == "async" and result["status"] in ("pending", "processing"):
+        deadline = time.time() + config.OPENAI_WAIT_TIMEOUT_S
+        task, ticks = None, 0
+        while time.time() < deadline:
+            task = store.get_task(result["task_id"])
+            if task and task["status"] in ("completed", "failed"):
+                break
+            await asyncio.sleep(1.0)
+            ticks += 1
+            if ticks % 10 == 0:
+                yield ": keep-alive\n\n"
+        if task and task["status"] == "completed":
+            extra = task.get("final_reply") or ""
+            if extra and extra != instant:
+                for piece in openai_api.split_text("\n\n" + extra):
+                    yield frame("response.output_text.delta", item_id=msg_id,
+                                output_index=0, content_index=0, delta=piece)
+                written += 2 + len(extra)
+                final_text = instant + "\n\n" + extra
+        elif task and task["status"] == "failed":
+            note = f"\n\n[后台任务失败] {task.get('error_msg') or '未知错误'}"
+            for piece in openai_api.split_text(note):
+                yield frame("response.output_text.delta", item_id=msg_id,
+                            output_index=0, content_index=0, delta=piece)
+            written += len(note)
+            final_text = instant + note
+
+    usage = openai_api.response_usage(
+        len(result["text"]) + result["history_chars"], written)
+    part = {"type": "output_text", "text": final_text, "annotations": []}
+    full_item = openai_api.message_item(msg_id, final_text)
+    yield frame("response.output_text.done", item_id=msg_id, output_index=0,
+                content_index=0, text=final_text)
+    yield frame("response.content_part.done", item_id=msg_id, output_index=0,
+                content_index=0, part=part)
+    yield frame("response.output_item.done", output_index=0, item=full_item)
+    yield frame("response.completed",
+                response=base_response("completed", final_text, usage,
+                                       [full_item]))
+    if parsed["store"]:
+        store.save_response(resp_id, result["session_id"], result["task_id"],
+                            model, result["text"], final_text, "completed")
+
+
+@app.post("/v1/responses")
+async def openai_responses(request: Request):
+    """OpenAI Responses API 兼容入口。
+
+    `previous_response_id` 续接服务端会话历史（需上一轮 `store` 为 true）；
+    `input` 自带完整历史时按无状态处理。采样、路由、降级与 `/chat` 一致。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            openai_api.error_payload("请求体不是合法 JSON"), status_code=400)
+    try:
+        parsed = openai_api.parse_responses_request(body, dict(request.headers))
+    except openai_api.OpenAIError as exc:
+        return JSONResponse(
+            openai_api.error_payload(exc.message, exc.type, exc.code, exc.param),
+            status_code=exc.status)
+
+    prev_session = None
+    if parsed["previous_response_id"]:
+        prev = store.get_response(parsed["previous_response_id"])
+        if not prev:
+            return JSONResponse(
+                openai_api.error_payload(
+                    f"previous_response_id 不存在：{parsed['previous_response_id']}",
+                    "invalid_request_error", "previous_response_not_found",
+                    "previous_response_id"),
+                status_code=404)
+        prev_session = prev["session_id"]
+
+    if parsed["previous_response_id"]:
+        history_override = None          # 续接服务端会话历史
+    elif parsed["history"]:
+        history_override = parsed["history"]
+    elif parsed["session_id"]:
+        history_override = None          # 单条 input + 显式会话 id -> 读库
+    else:
+        history_override = []
+
+    session_id = (parsed["session_id"] or prev_session
+                  or f"resp-{uuid.uuid4().hex[:12]}")
+    wait_s = 0 if parsed["stream"] else (
+        config.OPENAI_WAIT_TIMEOUT_S if parsed["mode"] == openai_api.MODE_FINAL else 0)
+    try:
+        result = await _pipeline(
+            parsed["text"], session_id, parsed["tier"],
+            str(request.base_url).rstrip("/"),
+            history_override=history_override,
+            system_extra=parsed["system_extra"],
+            wait_timeout_s=wait_s)
+    except HTTPException as exc:
+        type_ = "rate_limit_error" if exc.status_code == 429 else "invalid_request_error"
+        code = "context_length_exceeded" if exc.status_code == 413 else None
+        return JSONResponse(
+            openai_api.error_payload(str(exc.detail), type_, code),
+            status_code=exc.status_code)
+
+    resp_id = "resp_" + uuid.uuid4().hex[:24]
+    msg_id = "msg_" + resp_id[len("resp_"):]
+    created = int(time.time())
+
+    if parsed["stream"]:
+        return StreamingResponse(
+            _stream_response(parsed, result, resp_id, msg_id, created),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    if result["status"] == "failed":
+        return JSONResponse(
+            openai_api.error_payload(
+                f"后台任务失败：{result['error'] or '未知错误'}",
+                "server_error", "backend_failed"),
+            status_code=502)
+
+    if result["mode"] == "async" and result["status"] == "completed":
+        content = result["final"] or result["instant"]
+    else:
+        content = result["instant"]
+
+    status, incomplete = "completed", None
+    if result["timed_out"]:
+        # 后台仍在跑：不谎称完成，用 incomplete + timeout 表明可续查
+        status, incomplete = "incomplete", "timeout"
+    usage = openai_api.response_usage(
+        len(result["text"]) + result["history_chars"], len(content))
+    payload = openai_api.response_payload(
+        resp_id, created, parsed["model"], content, status, usage,
+        _explore_meta(result), msg_id,
+        instructions=parsed["instructions"],
+        max_output_tokens=parsed["requested_max_tokens"],
+        temperature=parsed["requested_temperature"],
+        previous_response_id=parsed["previous_response_id"],
+        store=parsed["store"], incomplete_reason=incomplete)
+    if parsed["store"]:
+        store.save_response(resp_id, result["session_id"], result["task_id"],
+                            parsed["model"], result["text"], content, status)
+    return JSONResponse(payload)
+
+
+@app.get("/v1/responses/{response_id}")
+async def openai_get_response(response_id: str):
+    """按 id 取回已存储的 response（store=true 时才有）。"""
+    record = store.get_response(response_id)
+    if not record:
+        return JSONResponse(
+            openai_api.error_payload(
+                f"response 不存在：{response_id}", "invalid_request_error",
+                "not_found"),
+            status_code=404)
+    text = record.get("output_text") or ""
+    usage = openai_api.response_usage(
+        len(record.get("input_text") or ""), len(text))
+    msg_id = ("msg_" + response_id[len("resp_"):]
+              if response_id.startswith("resp_") else "msg_" + response_id)
+    return JSONResponse(openai_api.response_payload(
+        response_id, int(record.get("created_at") or 0),
+        record.get("model") or "", text, record.get("status") or "completed",
+        usage,
+        {"task_id": record.get("task_id"), "process_mode": "stored",
+         "session_id": record.get("session_id")},
+        msg_id))

@@ -297,6 +297,7 @@ python3 tests/test_slot_switch.py  # 槽位切换 / 上下文恒定
 python3 tests/test_stability.py    # 连续请求，N 从 /health 读
 python3 tests/quick_check.py       # 主路快速检查（约 1 分钟）
 python3 tests/test_openai_api.py   # OpenAI 兼容层：models / direct / instant / 超时 / 流式
+python3 tests/test_responses_api.py # Responses API：非流式 / 流式事件 / previous_response_id
 
 # 真机多轮消息传递（三轮不同数据量；结果写 logs/msgtest_round<N>.json）
 python3 tests/msg_rounds_test.py 1   # 小数据量：短对话，全部前台直答

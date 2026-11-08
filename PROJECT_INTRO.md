@@ -319,6 +319,35 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 
 **取舍**：`temperature` / `max_tokens` 只回显不生效，采样由服务端配置统一控制；`usage` 是按字符数估算的近似值（中文约 1 token / 1.5 字），不是 tokenizer 精确计数。
 
+### 11.2 Responses API
+
+`POST /v1/responses` 是 OpenAI 的新协议，与 chat/completions 是**结构性差异**，不是简单别名：
+
+| 维度 | Chat Completions | Responses |
+|---|---|---|
+| 输入 | `messages[]` | `input`（字符串或消息数组）+ `instructions` |
+| 输出 | `choices[].message.content` | `output[]` 内的 `output_text` |
+| 结束标志 | `finish_reason` | `status` + `incomplete_details` |
+| 多轮 | 客户端每次带全量 `messages` | 可传 `previous_response_id` 由服务端续接 |
+| 流式 | `data:` 帧 + `[DONE]` | `event:` + `data:` 细分事件，**无 `[DONE]`** |
+
+**支持范围**
+
+- `input` 支持字符串与消息数组；`content` 支持字符串与 `input_text` / `output_text` 分段。`system` / `developer` 消息与 `instructions` 合并后追加到前台 system。
+- `model` 映射与 11.1 相同；`explore-fast` 或 `-fast` 后缀切即时模式。
+- `store` 默认 `true`：把 `response_id → session_id` 与输入输出写入 SQLite 独立表 `responses`（`CREATE TABLE IF NOT EXISTS`，不 ALTER 旧表）。
+- `previous_response_id`：查表定位原会话后读服务端历史；未知 id 返回 `404` + `previous_response_not_found`。
+- `GET /v1/responses/{id}`：取回已存储响应；`store=false` 的请求查不到（`404`）。
+- `stream=true`：完整事件序列 `response.created` → `in_progress` → `output_item.added` → `content_part.added` → `output_text.delta`… → `output_text.done` → `content_part.done` → `output_item.done` → `response.completed`，每帧带 `sequence_number`。
+
+**与 11.1 一致的取舍**
+
+- `max_output_tokens` / `temperature` 只回显；采样由服务端配置控制。
+- `usage` 同为字符估算：`input_tokens` / `output_tokens` / `total_tokens`，附 `*_details` 占位。
+- 等待后台超时时返回 `status="incomplete"` + `incomplete_details.reason="timeout"`，**不谎称 `completed`**；`explore.fallback=timeout` 可查，任务仍在后台继续。
+
+**明确未实现**：工具调用（`tools` / `tool_choice`）、结构化输出（`text.format`）、`reasoning`、`truncation`、`background` 模式、`input_image` / `input_file` 等非文本模态。这些字段会被接受但不生效，或按纯文本处理——不是"完整 Responses 实现"，只覆盖文本对话链路。
+
 ---
 
 ## 12. 质量保障：测试与 CI
