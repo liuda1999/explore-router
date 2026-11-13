@@ -1,6 +1,8 @@
 # explore · 智能本地路由
 
-![explore 项目封面](docs/assets/cover.png)
+<p align="center">
+  <img src="docs/assets/cover.png" width="33%" alt="explore 项目封面">
+</p>
 
 ### Intelligent Local LLM Router
 
