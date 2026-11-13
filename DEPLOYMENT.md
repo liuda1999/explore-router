@@ -138,6 +138,7 @@ models/embedding/fast-bge-base-zh-v1.5/tokenizer.json
 | `slots.*.type` | `local`（默认）或 `api` | `api` 槽位不填本地 model 文件，填 `base_url` / `model` |
 | `slots.*.model` | 你的 GGUF 相对路径（api 槽位填**远端模型名**） | 相对工作区根目录 |
 | `slots.*.base_url` / `api_key_env` | api 槽位的 API 根地址与密钥环境变量名 | 密钥本体放环境变量，不要提交进配置文件 |
+| `slots.*.context_window` | api 槽位上下文窗口；**缺省 = 启动时自动探测上游**（ollama），声明值与探测值取 min | 上游报超限时运行期自动收缩生效窗口；见 `/config` 的 `context_window_effective/detected/source` |
 | `slots.*.context_window` | api 槽位的远端模型窗口（tokens） | 影响历史预算与任务包截断，按真实模型填 |
 | `slots.*.vram_mb` | **目标机实测**的权重 + KV 显存（仅 local 槽位） | 不填则按 `weight_mb*1.35+512` 粗估，可能误判 |
 | `slots.*.placement` | 单卡用 `auto`；多卡大模型可 `spread` | 单卡写了 `spread` 会自动退化，不会报错 |

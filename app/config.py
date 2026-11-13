@@ -184,6 +184,9 @@ for _key, _d in _slots_cfg.items():
         _extra = _d.get("extra_body")
         if _extra is not None and not isinstance(_extra, dict):
             _fail(f"slots.{_key}.extra_body 必须是映射: {_extra}")
+        # context_window 缺省 None = 启动时自动探测上游（ollama /api/show）；
+        # 显式声明则与探测值取 min 生效
+        _cw = _d.get("context_window")
         _meta.update({
             "path": None,
             "provider": _provider,
@@ -192,7 +195,7 @@ for _key, _d in _slots_cfg.items():
             "base_url": str(_d.get("base_url", "") or "").rstrip("/"),
             "api_key": str(_d.get("api_key", "") or ""),
             "api_key_env": str(_d.get("api_key_env", "") or ""),
-            "context_window": int(_d.get("context_window", API_DEFAULT_CTX)),
+            "context_window": (int(_cw) if _cw not in (None, "") else None),
             "slot_max_tokens": _d.get("max_output_tokens"),
             "devices": [],
             "devices_str": "",
@@ -294,10 +297,12 @@ TIER_FALLBACKS = {
     for k, v in (_routing.get("tier_fallbacks") or {}).items()
 }
 
-# 前台上限窗口：local 前台 = 全局 NUM_CTX；api 前台 = 该槽位声明的 context_window。
+# 前台上限窗口：local 前台 = 全局 NUM_CTX；api 前台 = 该槽位声明的 context_window
+# （未声明时先用默认值，启动探测后会自动更新为上游真实值）。
 # 历史预算 / 输入上限由它推导，与本地后台槽位的 NUM_CTX 解耦。
 FRONT_NUM_CTX = (NUM_CTX if FRONT_TYPE == "local"
-                 else int(MODELS_META[FRONT_KEY]["context_window"]))
+                 else int(MODELS_META[FRONT_KEY]["context_window"]
+                          or API_DEFAULT_CTX))
 
 _emb = _S.get("embedding", {}) or {}
 EMBED_PROVIDER = str(_env("EMBED_PROVIDER", _emb.get("provider", "onnx"))).lower()
@@ -418,7 +423,7 @@ def _validate():
                       f"{v['base_url']}")
             if not v["model_ref"]:
                 _fail(f"slots.{k}.model 不能为空（type: api 填远端模型名，如 deepseek-chat）")
-            if v["context_window"] < 1024:
+            if v.get("context_window") is not None and v["context_window"] < 1024:
                 _fail(f"slots.{k}.context_window 太小: {v['context_window']}")
             if v.get("slot_max_tokens") is not None and int(v["slot_max_tokens"]) <= 0:
                 _fail(f"slots.{k}.max_output_tokens 必须为正数: {v['slot_max_tokens']}")
@@ -881,6 +886,60 @@ for _key in MODELS_META:
                        "available": _ok, "reason": _reason}
 
 
+# ---- api 槽位上游上下文自动探测（v2.5.1）------------------------------------
+# 启动时由 ApiBackend 向上游探测真实 context_length（ollama: /api/show），
+# 探测结果记录到 SLOT_CTX_EFFECTIVE 并参与 slot_ctx()/预算/413 阈值计算：
+#   effective = min(声明值, 探测值)；未声明时 = 探测值（缺省 API_DEFAULT_CTX）。
+# 运行期若上游报「上下文超限」，clamp_slot_context() 把生效值对半收缩自适应。
+SLOT_CTX_EFFECTIVE = {}
+
+
+def _declared_ctx(key):
+    m = MODELS_META.get(key) or {}
+    return int(m.get("context_window") or 0) or None
+
+
+def record_detected_context(key, detected, source):
+    """记录上游探测到的 context_length，并计算生效值（含前台窗口联动）。"""
+    if key not in MODELS_META or not detected or int(detected) <= 0:
+        return
+    with _ADMIN_WRITE_LOCK:
+        declared = _declared_ctx(key)
+        effective = min(declared, int(detected)) if declared else int(detected)
+        effective = max(1024, effective)
+        clamped = bool(declared and declared > int(detected))
+        SLOT_CTX_EFFECTIVE[key] = {
+            "declared": declared, "detected": int(detected),
+            "effective": effective, "source": source, "clamped": clamped,
+        }
+        if key == FRONT_KEY:
+            # 前台窗口变化联动：历史预算 / 输入上限 / 413 阈值全部重算
+            global FRONT_NUM_CTX
+            FRONT_NUM_CTX = effective
+            _recompute_derived()
+
+
+def clamp_slot_context(key, reason=""):
+    """运行期自适应：上游报上下文超限时把生效窗口对半收缩（下限 1024）。"""
+    with _ADMIN_WRITE_LOCK:
+        eff = SLOT_CTX_EFFECTIVE.setdefault(key, {
+            "declared": _declared_ctx(key),
+            "detected": None,
+            "effective": slot_ctx(key) if key in MODELS_META else API_DEFAULT_CTX,
+            "source": "declared", "clamped": False})
+        old = int(eff["effective"])
+        new = max(1024, old // 2)
+        eff["effective"] = new
+        eff["clamped"] = True
+        eff["source"] = (eff.get("source") or "declared") + f" → clamp({reason[:40]})"
+        if key == FRONT_KEY:
+            global FRONT_NUM_CTX
+            FRONT_NUM_CTX = new
+            _recompute_derived()
+    print(f"[ctx] slot {key} context clamped: {old} -> {new} ({reason[:80]})", flush=True)
+    return new
+
+
 def slot_fits_now(key, force=True):
     """运行期复查：启动后若别的进程占用显存，加载前重新判断，避免 OOM。
 
@@ -918,8 +977,16 @@ def slot_fits_now(key, force=True):
 
 
 def slot_ctx(key):
-    """槽位有效上下文窗口：local 槽位 = 全局 NUM_CTX；api 槽位 = context_window。"""
+    """槽位有效上下文窗口。
+
+    local 槽位 = 全局 NUM_CTX；api 槽位优先用「上游探测后的生效值」
+    （SLOT_CTX_EFFECTIVE，启动探测 + 运行期自适应钳制），未探测时
+    用声明值 context_window（缺省 API_DEFAULT_CTX）。
+    """
     m = MODELS_META.get(key) or {}
+    eff = SLOT_CTX_EFFECTIVE.get(key)
+    if eff:
+        return int(eff["effective"])
     if m.get("type") == "api":
         return int(m.get("context_window") or API_DEFAULT_CTX)
     return NUM_CTX
@@ -945,10 +1012,18 @@ def describe():
         }
         if v["type"] == "api":
             key_env = v["api_key_env"] or None
+            eff = SLOT_CTX_EFFECTIVE.get(k)
             d.update({
                 "provider": v.get("provider") or "openai",
                 "base_url": v["base_url"],
                 "context_window": v["context_window"],
+                "context_window_effective": (eff["effective"] if eff
+                                             else (v["context_window"]
+                                                   or API_DEFAULT_CTX)),
+                "context_window_detected": (eff or {}).get("detected"),
+                "context_window_source": (eff or {}).get("source")
+                                        or ("declared" if v["context_window"]
+                                            else f"default({API_DEFAULT_CTX})"),
                 "max_output_tokens": v.get("slot_max_tokens"),
                 "api_key_source": (f"env:{key_env}" if key_env and os.getenv(key_env)
                                    else ("settings.yaml" if v["api_key"] else None)),
@@ -1092,7 +1167,7 @@ _SLOT_API = [
     ("extra_body", "dict", "可选：附加到每次请求体的字段（如 {\"think\": true}；ollama 槽位默认已带 think:false）"),
     ("api_key", "str", "明文密钥（仅显示掩码 ***；输入新值覆盖、留空=清除；推荐留空走 api_key_env）"),
     ("api_key_env", "str", "密钥环境变量名，优先于 api_key；密钥不出现在日志与 /config"),
-    ("context_window", "int", "远端模型上下文窗口（tokens）；历史预算与任务包截断按它计算"),
+    ("context_window", "int", "远端模型上下文窗口（tokens）；**留空 = 启动时自动探测上游**（ollama /api/show，声明值与探测值取 min 生效）"),
     ("max_output_tokens", "int", "可选：该槽位生成上限，缺省用全局值"),
 ]
 

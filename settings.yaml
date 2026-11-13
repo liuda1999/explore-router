@@ -82,7 +82,9 @@ budget:
 #   model          远端模型名（如 deepseek-chat）
 #   api_key        明文密钥（可填；推荐留空走 api_key_env）
 #   api_key_env    密钥环境变量名，优先于 api_key；密钥绝不写日志或 /config
-#   context_window 远端模型上下文窗口（tokens），用于历史预算与任务包截断
+#   context_window 远端模型上下文窗口（tokens），用于历史预算与任务包截断；
+#                  留空 = 启动时自动探测上游（ollama /api/show，默认启用）；
+#                  声明值会与探测值取 min 生效，防止声明值大于上游实际能力
 #   max_output_tokens  可选，按槽位覆盖生成上限（缺省用 runtime.max_output_tokens）
 #   api 槽位不占本地显存：vram_plan 恒 available，不参与互斥切换；
 #   前台槽位（resident: true）同样允许 type: api（历史预算按其 context_window 计算）。

@@ -16,6 +16,18 @@ import httpx
 from . import config
 from .llama import LlamaServer
 
+# 上游「上下文超限」响应特征（各厂商措辞不同，宽松匹配）
+_CTX_OVERFLOW_PATTERNS = (
+    "context length", "context_length", "context window", "maximum context",
+    "reduce the length", "input length exceeds", "too large",
+    "exceeds the maximum", "上下文长度", "超出上下文", "上下文超限",
+)
+
+
+def _ctx_overflow(body):
+    low = (body or "").lower()
+    return any(p in low for p in _CTX_OVERFLOW_PATTERNS)
+
 
 class ApiBackend:
     """线上模型的槽位后端（provider: openai | ollama）。
@@ -87,6 +99,43 @@ class ApiBackend:
                            f"{self.base_url} -> {detail}")
             print(f"[warn] api slot {self.name} probe {level}: {detail}",
                   flush=True)
+        # 自动探测上游上下文长度（默认启用）：探测结果进入预算与阈值计算
+        await self._detect_context()
+
+    async def _detect_context(self):
+        """探测上游真实 context length。
+
+        - ollama：POST /api/show -> model_info 中以 .context_length 结尾的
+          字段即上游真实窗口（权威值）；
+        - openai：无标准探测端点，探测不到时沿用声明值，运行期由
+          clamp_slot_context 自适应兜底。
+        探测后经 config.record_detected_context 计算「生效窗口」：
+        effective = min(声明值, 探测值)；未声明时 = 探测值。
+        """
+        if self.provider != "ollama":
+            return
+        try:
+            c = await self._ensure_client()
+            r = await c.post(self.base_url + "/api/show",
+                             json={"model": self.model},
+                             headers=self._headers(), timeout=15)
+            if r.status_code != 200:
+                self._log_line(f"[api] context detect skipped: /api/show "
+                               f"{r.status_code}")
+                return
+            info = (r.json().get("model_info") or {})
+            detected = next((int(v) for k, v in info.items()
+                             if k.endswith(".context_length")), None)
+            if detected:
+                config.record_detected_context(
+                    self.name, detected, "auto(ollama /api/show)")
+                self._log_line(f"[api] context detected: {detected} tokens "
+                               f"(model_info)")
+                print(f"[ctx] slot {self.name} detected upstream context "
+                      f"{detected} tokens", flush=True)
+        except Exception as exc:
+            self._log_line(f"[api] context detect failed: {type(exc).__name__}: "
+                           f"{str(exc)[:120]}")
 
     async def _ping(self):
         """连通性探测，返回 (healthy, detail)。
@@ -187,6 +236,10 @@ class ApiBackend:
                         f"empty output from {self.name} ({self.model}): "
                         f"{self.last_error}")
                 self.last_error = f"chat {r.status_code}: {r.text[:200]}"
+                # 上游报上下文超限：把生效窗口对半收缩自适应，后续预算/阈值
+                # 随之收紧，避免客户端反复撞墙
+                if r.status_code in (400, 413) and _ctx_overflow(r.text):
+                    config.clamp_slot_context(self.name, r.text[:120])
                 if r.status_code >= 500 or r.status_code == 429:
                     if attempt == 1:
                         await asyncio.sleep(1.0)
