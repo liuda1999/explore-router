@@ -109,7 +109,7 @@ curl -s http://127.0.0.1:8100/config    # ★ 确认解析出的后端、卡数�
 | `slots.<key>.type` | `local`（默认）/ `api` | **api = 线上 OpenAI 兼容槽位**：不占显存、不参与互斥切换；前台亦可 |
 | `slots.<key>.model` | 模型文件（相对工作区）；api 槽位填**远端模型名** | **换模型只改这里** |
 | `slots.<key>.base_url` / `api_key` / `api_key_env` | api 槽位：API 根地址、明文密钥、密钥环境变量名 | `api_key_env` 优先；密钥不落日志与 `/config` |
-| `slots.<key>.context_window` | api 槽位远端模型窗口（tokens）；**缺省 = 启动时自动探测上游**（ollama /api/show；声明值与探测值取 min 生效），运行期上游报超限自动对半收缩 | 前台窗口联动历史预算与 413 阈值；`/config` 的 `context_window_effective/detected/source` 可见 |
+| `slots.<key>.context_window` | api 槽位远端模型窗口（tokens）；**缺省 = 自动探测上游**，运行时窗口（`/api/ps`，即 OLLAMA_CONTEXT_LENGTH 生效值）优先，架构上限仅兜底；声明值与探测值取 min。上游报超限或发生静默截断时自动收缩生效窗口 | 前台窗口联动历史预算与 413 阈值；`/config` 的 `context_window_effective/detected/source` 可见 |
 | `slots.<key>.max_output_tokens` | api 槽位生成上限（可选） | 缺省用 `runtime.max_output_tokens` |
 | `slots.<key>.quant` / `weight_mb` / `vram_mb` | 量化、权重估算、权重+KV 总显存估算（仅 local） | `weight_mb` 参与多卡自动分层扣减；`vram_mb` 用于显存可行性判断，**16G 单卡务必按实测填**；不填则按 `weight_mb*1.35+512` 粗估 |
 | `slots.<key>.placement` | `auto` / `spread` / `explicit` | 设备分配策略 |

@@ -108,15 +108,27 @@ def real_ollama_detect():
     async def run():
         b = ApiBackend("probe", OLLAMA_URL, MODEL, provider="ollama")
         await b.start()
-        eff = config.SLOT_CTX_EFFECTIVE.get("probe")
+        eff = config.SLOT_CTX_EFFECTIVE.get("probe")   # 启动期：架构上限兜底
+        await b.chat([{"role": "user", "content": "回复 OK"}], max_tokens=8)
+        eff2 = config.SLOT_CTX_EFFECTIVE.get("probe")  # 推理后：运行时校准
+        # 推理后模型必然已加载，/api/ps 是权威运行时窗口
+        ps = json.loads(urllib.request.urlopen(OLLAMA_URL + "/api/ps",
+                                               timeout=5).read())
+        runtime = next((int(m["context_length"]) for m in ps.get("models", [])
+                        if (m.get("name") or "").startswith(MODEL.split(":")[0])
+                        and m.get("context_length")), None)
         await b.stop()
-        return eff
+        return eff, eff2, runtime
 
     import asyncio
-    eff = asyncio.run(run())
-    check("C3_真实ollama探测_262144",
-          eff and eff["detected"] == 262144 and eff["effective"] == 262144,
-          eff)
+    eff, eff2, runtime = asyncio.run(run())
+    arch_max = 262144
+    check("C3a_启动探测_不高于架构上限",
+          eff and eff["effective"] <= arch_max, eff)
+    check("C3b_推理后校准_运行时窗口优先",
+          eff2 and runtime and eff2["effective"] == runtime
+          and "api/ps" in eff2["source"],
+          {"runtime(/api/ps)": runtime, "eff2": eff2})
 
 
 def live_service_check():

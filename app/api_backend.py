@@ -59,6 +59,7 @@ class ApiBackend:
         self.last_error = ""
         self.last_timings = {}
         self.last_finish_reason = None
+        self._runtime_synced = False   # 首次成功推理后校准 /api/ps 运行时窗口
         self._client = None
 
     @property
@@ -103,18 +104,31 @@ class ApiBackend:
         await self._detect_context()
 
     async def _detect_context(self):
-        """探测上游真实 context length。
+        """探测上游真实可用的 context length（默认启用）。
 
-        - ollama：POST /api/show -> model_info 中以 .context_length 结尾的
-          字段即上游真实窗口（权威值）；
-        - openai：无标准探测端点，探测不到时沿用声明值，运行期由
-          clamp_slot_context 自适应兜底。
-        探测后经 config.record_detected_context 计算「生效窗口」：
+        ollama 探测分两层，**运行时窗口优先**：
+        - /api/ps 中已加载实例的 context_length = 服务端实际分配的窗口
+          （OLLAMA_CONTEXT_LENGTH / num_ctx 生效值，权威）；
+        - /api/show 的 model_info *.context_length = 模型架构上限，
+          仅在实例未加载时作为上界兜底。
+        openai：无标准探测端点，沿用声明值，运行期由 clamp_slot_context
+        兜底。探测结果经 config.record_detected_context 计算「生效窗口」：
         effective = min(声明值, 探测值)；未声明时 = 探测值。
         """
         if self.provider != "ollama":
             return
         try:
+            runtime = await self._query_runtime_ctx()
+            if runtime:
+                config.record_detected_context(
+                    self.name, runtime, "auto(ollama /api/ps)")
+                self._log_line(f"[api] context detected(runtime): {runtime} "
+                               f"tokens (/api/ps)")
+                print(f"[ctx] slot {self.name} runtime context {runtime} "
+                      f"tokens", flush=True)
+                return
+            # 实例未加载（懒加载）：先用架构上限兜底，首次成功对话后会
+            # 再同步一次 /api/ps 的运行时值
             c = await self._ensure_client()
             r = await c.post(self.base_url + "/api/show",
                              json={"model": self.model},
@@ -124,18 +138,44 @@ class ApiBackend:
                                f"{r.status_code}")
                 return
             info = (r.json().get("model_info") or {})
-            detected = next((int(v) for k, v in info.items()
-                             if k.endswith(".context_length")), None)
-            if detected:
+            arch = next((int(v) for k, v in info.items()
+                         if k.endswith(".context_length")), None)
+            if arch:
                 config.record_detected_context(
-                    self.name, detected, "auto(ollama /api/show)")
-                self._log_line(f"[api] context detected: {detected} tokens "
-                               f"(model_info)")
-                print(f"[ctx] slot {self.name} detected upstream context "
-                      f"{detected} tokens", flush=True)
+                    self.name, arch, "auto(arch max, 待 /api/ps 校准)")
+                self._log_line(f"[api] context detected(arch upper bound): "
+                               f"{arch} tokens；运行时窗口将在首次推理后校准")
+                print(f"[ctx] slot {self.name} arch context upper bound "
+                      f"{arch} tokens（运行时待校准）", flush=True)
         except Exception as exc:
             self._log_line(f"[api] context detect failed: {type(exc).__name__}: "
                            f"{str(exc)[:120]}")
+
+    async def _query_runtime_ctx(self):
+        """/api/ps：返回本槽位模型已加载实例的实际分配窗口（未加载返回 None）。"""
+        try:
+            c = await self._ensure_client()
+            r = await c.get(self.base_url + "/api/ps", timeout=5)
+            if r.status_code != 200:
+                return None
+            for m in (r.json().get("models") or []):
+                name = (m.get("name") or m.get("model") or "")
+                if name.split(":")[0] == self.model.split(":")[0] and m.get("context_length"):
+                    return int(m["context_length"])
+        except Exception:
+            pass
+        return None
+
+    async def sync_runtime_ctx_after_inference(self):
+        """首次成功推理后校准：此时模型必然已加载，/api/ps 的运行时窗口
+        是权威值（覆盖启动期用架构上限兜底的临时生效值）。"""
+        if self.provider != "ollama":
+            return
+        runtime = await self._query_runtime_ctx()
+        if runtime:
+            config.record_detected_context(
+                self.name, runtime, "auto(ollama /api/ps)")
+            self._log_line(f"[api] runtime ctx calibrated: {runtime} tokens")
 
     async def _ping(self):
         """连通性探测，返回 (healthy, detail)。
@@ -205,6 +245,29 @@ class ApiBackend:
         content = ((choice.get("message") or {}).get("content") or "").strip()
         return content, (choice.get("finish_reason") or "stop"), timings
 
+    async def _post_inference_guard(self, timings):
+        """ollama 推理成功后的两道护栏（静默截断是 ollama 的默认行为，
+        不报错——只能从用量侧检测）：
+
+        1. 运行时校准：首次成功推理后模型必然已加载，/api/ps 的运行时
+           窗口是权威值，覆盖启动期用架构上限兜底的临时生效值；
+        2. 静默截断检测：prompt_tokens 逼近/达到生效窗口时，说明本次
+           输入被服务端截断——把生效窗口收敛到实测容量。
+        """
+        eff = (config.SLOT_CTX_EFFECTIVE.get(self.name) or {})
+        eff_now = int(eff.get("effective") or 0)
+        pt = int((timings or {}).get("prompt_tokens") or 0)
+        if not self._runtime_synced:
+            self._runtime_synced = True
+            await self.sync_runtime_ctx_after_inference()
+        if pt and eff_now and pt >= int(eff_now * 0.95):
+            config.record_detected_context(
+                self.name, pt, "auto(observed truncation cap)")
+            self._log_line(f"[api] silent truncation detected: prompt_tokens "
+                           f"{pt} >= {eff_now}; effective ctx -> {pt}")
+            print(f"[ctx] slot {self.name} silent truncation: effective ctx "
+                  f"-> {pt} tokens", flush=True)
+
     async def chat(self, messages, max_tokens=512, temperature=0.2):
         """按 provider 调用推理端点；解析 content 与 finish_reason，
         绝不静默返回空串。
@@ -229,6 +292,8 @@ class ApiBackend:
                     self._log_line(
                         f"[api] chat ok finish={finish} "
                         f"chars={len(content)} elapsed_ms={timings['elapsed_ms']}")
+                    if self.provider == "ollama":
+                        await self._post_inference_guard(timings)
                     if content:
                         return content
                     self.last_error = "empty content from api model"
