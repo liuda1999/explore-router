@@ -1,9 +1,10 @@
 # explore · Intelligent Local LLM Router — Project Introduction
 
-> **Version** v2.5.0 ｜ **Updated** 2026-11-14 ｜ **Configuration-driven edition + online API slots**
+> **Version** v2.6.0 ｜ **Updated** 2026-11-14 ｜ **Configuration-driven edition + online API slots**
 > Workspace: `<deployment directory>` (scripts resolve paths from their own location; nothing is hard-coded)
 > Bilingual entry point: [README.md](README.md) ｜ 中文版: [PROJECT_INTRO.md](PROJECT_INTRO.md)
 >
+> **New in v2.6.0**: upstream context length auto-detection (runtime window priority + continuous calibration + silent-truncation adaptation), paragraph-boundary task truncation, strong-intent-first routing fix, README cover.
 > **New in v2.5.0**: ① Slots support `type: api` — OpenAI-compatible cloud models,
 > including the resident front slot; ② N-tier routing (`tier_thresholds` /
 > `tier_complex_words` / `tier_fallbacks`); ③ Built-in Web console (`GET /console`)

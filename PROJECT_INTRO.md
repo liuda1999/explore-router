@@ -1,9 +1,10 @@
 # explore 智能本地路由 — 项目介绍
 
-> **版本** v2.5.0 ｜ **更新** 2026-11-14 ｜ **配置驱动版 + 线上 API 槽位**
+> **版本** v2.6.0 ｜ **更新** 2026-11-14 ｜ **配置驱动版 + 线上 API 槽位**
 > 工作区：`<部署目录>`（脚本按自身位置定位，不写死路径）
 > 双语入口：[README.md](README.md) ｜ English edition: [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md)
 >
+> **v2.6.0 新增**：上游上下文长度自动探测（运行时窗口优先 + 持续校准 + 静默截断自适应）、任务包按段落/句子边界截断、路由强意图优先（修复短句双命中误路由）、README 封面。
 > **v2.5.0 新增**：① 槽位支持 `type: api`（OpenAI 兼容线上模型，前台亦可）；
 > ② N 档分级（`tier_thresholds` / `tier_complex_words` / `tier_fallbacks`）；
 > ③ Web 控制台（`GET /console`）+ `/admin/config` 参数热调并持久化到

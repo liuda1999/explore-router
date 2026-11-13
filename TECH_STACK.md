@@ -2,7 +2,7 @@
 
 > **English summary**: This document explains the full technology stack of `explore`, why each component was chosen, what the pinned versions are, how the layers interact, and what the compatibility matrix looks like. For the short version see [README.md](README.md); for installation see [DEPLOYMENT.md](DEPLOYMENT.md).
 >
-> **版本** v2.5.0 ｜ **更新** 2026-11-14 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
+> **版本** v2.6.0 ｜ **更新** 2026-11-14 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
 >
 > **v2.5.0 新增组件**：`app/api_backend.py`（线上 API 槽位后端，复用 httpx）；
 > `app/console.py`（单文件 Web 控制台，零依赖）；`cli.py`（Python CLI，仅标准库

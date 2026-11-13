@@ -2,7 +2,7 @@
 
 > **English summary**: A complete, device-agnostic deployment runbook — prerequisites, the exact startup sequence, hardware scenarios (multi-GPU NVIDIA / single AMD / small-VRAM single card / online-API slots), environment overrides, a first-boot acceptance checklist, regression commands, failure triage, upgrade/rollback, and CI wiring. Short version in [README.md](README.md); component rationale in [TECH_STACK.md](TECH_STACK.md).
 >
-> **版本** v2.5.0 ｜ **更新** 2026-11-14
+> **版本** v2.6.0 ｜ **更新** 2026-11-14
 > **核心原则**：不写死路径、不装系统服务、不设开机自启、不污染系统 Python 环境。
 
 ---
