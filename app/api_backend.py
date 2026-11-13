@@ -59,7 +59,6 @@ class ApiBackend:
         self.last_error = ""
         self.last_timings = {}
         self.last_finish_reason = None
-        self._runtime_synced = False   # 首次成功推理后校准 /api/ps 运行时窗口
         self._client = None
 
     @property
@@ -249,17 +248,17 @@ class ApiBackend:
         """ollama 推理成功后的两道护栏（静默截断是 ollama 的默认行为，
         不报错——只能从用量侧检测）：
 
-        1. 运行时校准：首次成功推理后模型必然已加载，/api/ps 的运行时
-           窗口是权威值，覆盖启动期用架构上限兜底的临时生效值；
+        1. 运行时窗口持续校准：**每次**成功推理后都从 /api/ps 重读运行时
+           窗口（模型加载时的实际分配值）——用户在 Ollama 侧修改
+           OLLAMA_CONTEXT_LENGTH 并触发模型重载后，路由器会自动跟踪，
+           无需重启；查询仅毫秒级，相对推理耗时可忽略。
         2. 静默截断检测：prompt_tokens 逼近/达到生效窗口时，说明本次
            输入被服务端截断——把生效窗口收敛到实测容量。
         """
         eff = (config.SLOT_CTX_EFFECTIVE.get(self.name) or {})
         eff_now = int(eff.get("effective") or 0)
         pt = int((timings or {}).get("prompt_tokens") or 0)
-        if not self._runtime_synced:
-            self._runtime_synced = True
-            await self.sync_runtime_ctx_after_inference()
+        await self.sync_runtime_ctx_after_inference()
         if pt and eff_now and pt >= int(eff_now * 0.95):
             config.record_detected_context(
                 self.name, pt, "auto(observed truncation cap)")
