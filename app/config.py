@@ -973,6 +973,8 @@ def describe():
         "tier_to_slot": TIER_TO_SLOT,
         "tier_thresholds": TIER_THRESHOLDS,
         "tier_fallbacks": TIER_FALLBACKS,
+        "complex_words": COMPLEX_WORDS,
+        "tier_complex_words": TIER_COMPLEX_WORDS,
         "limits": {
             "max_input_chars": MAX_INPUT_CHARS,
             "front_max_tokens": FRONT_MAX_TOKENS,

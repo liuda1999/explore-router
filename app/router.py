@@ -16,15 +16,21 @@ def classify(text, prefer=None):
     """返回配置里的档位名（默认 simple / mid / heavy，可扩展更多档）。
 
     档位名来自 routing.tier_order，代码不写死。语义：
-    - 第 1 档 = 直接回答；阈值（routing.tier_thresholds）与全局复杂词沿用
-      旧三档规则；每档可配专属强词表（tier_complex_words），从最高档往下判。
+    - 第 1 档 = 直接回答；**强意图信号优先**：全局复杂词命中 >= 2 直接归
+      重档（沿用 v2.4 语义——「请详细分析…」这类短句不该被长度阈值截胡）；
+    - 阈值（routing.tier_thresholds）与档位专属强词表（tier_complex_words）
+      从最高档往下判；单个复杂词命中归常规后台档。
     """
     if prefer in config.TIER_ORDER:
         return prefer, f"explicit prefer_tier={prefer}"
     n = len(text.strip())
     low = text.lower()
     order = config.TIER_ORDER
-    # 1) 阈值与档位专属词表：从最高档往下，首个命中即归档
+    hits = [w for w in config.COMPLEX_WORDS if w.lower() in low]
+    # 1) 强意图信号优先：全局复杂词 >=2 命中 -> 重档
+    if len(hits) >= 2:
+        return order[2], f"complex words={hits[:3]}"
+    # 2) 阈值与档位专属词表：从最高档往下，首个命中即归档
     for tier in reversed(order[1:]):
         thr = config.TIER_THRESHOLDS.get(tier)
         if thr is not None and n >= thr:
@@ -33,10 +39,7 @@ def classify(text, prefer=None):
         t_hits = [w for w in t_words if w.lower() in low]
         if t_hits:
             return tier, f"tier words={t_hits[:3]}"
-    # 2) 全局复杂词表（旧语义：>=2 个命中 -> 重档；>=1 -> 常规后台档）
-    hits = [w for w in config.COMPLEX_WORDS if w.lower() in low]
-    if len(hits) >= 2:
-        return order[2], f"complex words={hits[:3]}"
+    # 3) 单个全局复杂词 -> 常规后台档
     if hits:
         return order[1], f"complex words={hits[:3]}"
     return order[0], f"short input len={n}"
