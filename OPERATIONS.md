@@ -1,6 +1,6 @@
 # explore 智能本地路由 — 运维手册
 
-> 配置驱动版 v2.4.0 / 2026-11-08 / 工作区：`<部署目录>`（脚本按自身位置定位，不写死绝对路径）
+> 配置驱动版 v2.5.0 / 2026-11-14 / 工作区：`<部署目录>`（脚本按自身位置定位，不写死绝对路径）
 
 ## 文档导航
 
@@ -44,11 +44,14 @@ explore-router/
 │   ├── llama.py           运行时进程管理（不含硬件常量）
 │   ├── embed.py           ONNX embedding
 │   ├── store.py           SQLite 任务状态与会话历史
+│   ├── api_backend.py     线上 API 槽位后端（type: api）
+│   ├── console.py         Web 控制台页面（GET /console）
 │   ├── router.py          分级 + 互斥槽位（按 key 操作）
 │   ├── prompts.py         统一消息模板（任务包 / 前缀 / 降级文案）
 │   ├── compaction.py      上下文压缩（滚动摘要模板与缓存键）
 │   ├── openai_api.py      OpenAI 协议转换（chat/completions + Responses）
 │   └── main.py            FastAPI 接口
+├── cli.py                 Python CLI（启停/配置/调试，仅标准库）
 ├── models/                GGUF 与 embedding（路径在 settings.yaml 中写）
 ├── pylib/                 Python 依赖
 ├── data/                  state.db、router.pid
@@ -88,41 +91,104 @@ curl -s http://127.0.0.1:8100/config    # ★ 确认解析出的后端、卡数�
 | `runtime.server_bin` / `lib_dir` | 运行时二进制与动态库目录 | 换运行时或换机器路径 |
 | `runtime.gpu_backend` | `auto` / `cuda` / `rocm` / `cpu` | 强制指定后端时用 |
 | `runtime.n_gpu_layers` | 卸载到 GPU 的层数（默认 99） | CPU/部分卸载场景可调小 |
-| `runtime.max_output_tokens` | 后台单次生成上限（默认 1024） | 长文任务可调大，注意耗时 |
-| `runtime.queue_maxsize` | 后台排队上限（默认 32） | 满时 `/chat` 返回 429；0 表示不限制 |
-| `runtime.ports.{api,front,slot}` | 三个端口 | 避免端口冲突 |
+| `runtime.max_output_tokens` | 后台单次生成上限（默认 1024） | **可热调**；长文任务可调大，注意耗时 |
+| `runtime.queue_maxsize` | 后台排队上限（默认 32） | 满时 `/chat` 返回 429；0 表示不限制（启动期参数） |
+| `runtime.ports.{api,front,slot}` | 三个端口 | 避免端口冲突（启动期参数） |
 | `runtime.startup_timeout_s` / `request_timeout_s` | 超时 | 慢盘/大模型可调大 |
-| `context.num_ctx` | `auto` 或整数 | `auto` 按显存查 `auto_table` |
+| `context.num_ctx` | `auto` 或整数 | `auto` 按显存查 `auto_table`（启动期参数） |
 | `context.auto_table` | 总显存 → 默认 N 的启发式表 | **最低 32K**；更大上下文需实测后加表项或用 `NUM_CTX` 覆盖 |
-| `context.kv_cache` | KV 精度（如 `q8_0`） | 只影响显存，不改变 `num_ctx` |
-| `context.compaction.enabled` | 是否开启历史压缩（默认 `true`） | 关闭后退回「丢弃 + `history_truncated`」旧行为 |
-| `context.compaction.max_summary_chars` | 摘要长度上限（默认 800 字） | **太小会挤掉早期暗号**；实测 400 不足，800 可保留 5 个标记 |
-| `context.compaction.min_dropped_chars` | 被丢弃内容少于该值时不摘要（默认 600） | 小段丢弃直接丢，省一次前台调用 |
-| `embedding.onnx` / `tokenizer` | 嵌入模型路径 | 换嵌入模型 |
+| `context.kv_cache` | KV 精度（如 `q8_0`） | 只影响显存，不改变 `num_ctx`（启动期参数） |
+| `context.compaction.enabled` | 是否开启历史压缩（默认 `true`） | **可热调**；关闭后退回「丢弃 + `history_truncated`」旧行为 |
+| `context.compaction.max_summary_chars` | 摘要长度上限（默认 800 字） | **可热调**；**太小会挤掉早期暗号** |
+| `context.compaction.min_dropped_chars` | 被丢弃内容少于该值时不摘要（默认 600） | **可热调** |
+| `embedding.provider` | `onnx`（默认，本地 ONNX）/ `ollama`（Ollama 嵌入模型，无本地文件依赖） | 均失败时降级为纯文本线索；`/health.embedding` 可见 provider/dim/error |
+| `embedding.ollama_url` / `embedding.ollama_model` | ollama 嵌入的地址与模型（默认 `http://127.0.0.1:11434` / `bge-m3`） | 先 `ollama pull bge-m3` 再切换 provider |
+| `embedding.onnx` / `tokenizer` | 嵌入模型路径 | 换嵌入模型；初始化失败为非致命降级（见 `/health.embedding.error`） |
 | `budget.reserve_system_mb` | 系统/驱动预留显存，按可见卡数分摊 | 小显存设备可调小，但不建议为 0 |
 | `budget.headroom_ratio` | 显存安全余量（默认 0.10） | 装不下时宁可标记不可用，也不 OOM |
-| `slots.<key>.model` | 模型文件（相对工作区） | **换模型只改这里** |
-| `slots.<key>.quant` / `weight_mb` / `vram_mb` | 量化、权重估算、权重+KV 总显存估算 | `weight_mb` 参与多卡自动分层扣减；`vram_mb` 用于显存可行性判断，**16G 单卡务必按实测填**；不填则按 `weight_mb*1.35+512` 粗估 |
+| `slots.<key>.type` | `local`（默认）/ `api` | **api = 线上 OpenAI 兼容槽位**：不占显存、不参与互斥切换；前台亦可 |
+| `slots.<key>.model` | 模型文件（相对工作区）；api 槽位填**远端模型名** | **换模型只改这里** |
+| `slots.<key>.base_url` / `api_key` / `api_key_env` | api 槽位：API 根地址、明文密钥、密钥环境变量名 | `api_key_env` 优先；密钥不落日志与 `/config` |
+| `slots.<key>.context_window` | api 槽位远端模型窗口（tokens） | api 前台的历史预算按它计算 |
+| `slots.<key>.max_output_tokens` | api 槽位生成上限（可选） | 缺省用 `runtime.max_output_tokens` |
+| `slots.<key>.quant` / `weight_mb` / `vram_mb` | 量化、权重估算、权重+KV 总显存估算（仅 local） | `weight_mb` 参与多卡自动分层扣减；`vram_mb` 用于显存可行性判断，**16G 单卡务必按实测填**；不填则按 `weight_mb*1.35+512` 粗估 |
 | `slots.<key>.placement` | `auto` / `spread` / `explicit` | 设备分配策略 |
-| `slots.<key>.split_ratio` | 可选，整数比例如 `[1, 2]` | 多卡分层比例；不写则按「空闲显存 − 前台预估占用」自动算。自动比例与实测偏差较大时可显式指定 |
-| `slots.<key>.resident` | 是否永久常驻前台 | **必须有且仅有一个 `true`**，否则启动失败 |
-| `routing.tier_order` | 三个档位的名称（默认 `simple/mid/heavy`） | 可改名（如 `quick/standard/deep`），需与 `tier_to_slot` 同步 |
-| `routing.tier_to_slot` | tier → 槽位 key | 增删槽位时同步改；指向不存在的槽位会启动失败 |
+| `slots.<key>.split_ratio` | 可选，整数比例如 `[1, 2]` | 多卡分层比例；不写则按「空闲显存 − 前台预估占用」自动算 |
+| `slots.<key>.resident` | 是否永久常驻前台 | **必须有且仅有一个 `true`**，否则启动失败；前台允许是 api 槽位 |
+| `routing.tier_order` | 档位名称列表（默认 `simple/mid/heavy`，可 3+ 档） | 第 1 个=直接回答；改名/增档需与映射、阈值同步 |
+| `routing.tier_to_slot` | tier → 槽位 key | 所有档位都必须有映射；指向不存在的槽位会启动失败 |
+| `routing.tier_thresholds` | 每档触发字符数（第 4+ 档必填） | 沿 `tier_order` 严格递增；**可热调** |
+| `routing.tier_complex_words` | 每档专属强词表（可选） | 命中即归入该档；**可热调** |
+| `routing.tier_fallbacks` | 档位降级链（可选，如 `heavy: [moe, cloud]`） | 映射槽位不可用时按序尝试，先于 `default_slot` |
 | `routing.default_slot` | 未知 tier 的兜底槽位 | 必须是已存在的槽位 |
-| `routing.mid_min_chars` / `heavy_min_chars` / `complex_words` | 分级规则 | 需满足 `0 < mid < heavy`，否则启动失败 |
-| `routing.max_input_chars` | 单次输入字符上限（`auto` = `num_ctx*1.5`） | 超限返回 413；防止超大请求 |
-| `frontend.max_tokens` | 即时回复上限（默认 256） | 前台回复过长可调 |
-| `frontend.history_budget_ratio` | 历史预算占「可用上下文 − 当前输入」的比例（默认 0.45） | **自动阈值**：短输入多带历史，长输入自动收紧 |
-| `frontend.history_min_chars` | 历史最小字符预算（默认 2048），输入上限会相应扣减 | 不建议低于 512 |
-| `frontend.history_max_messages` | 历史条数上限（默认 40） | 防止极端多轮拖慢 prefill |
-| `frontend.context_safety_tokens` | token 估算误差与模板开销预留（默认 256） | 小上下文设备可保留默认 |
-| `frontend.restart_cooldown_s` | 前台异常重启冷却（默认 30s） | 防止崩溃循环 |
-| `frontend.progress_window_s` | 进度提问关联的任务时间窗（默认 1800s） | 避免把很久前的任务当进度 |
-| `frontend.system_prompt` | 前台提示词 | 与模型无关 |
+| `routing.mid_min_chars` / `heavy_min_chars` / `complex_words` | 旧三档分级规则（缺省阈值来源） | **可热调**；与 `tier_thresholds` 联动同步 |
+| `routing.max_input_chars` | 单次输入字符上限（`auto` 按前台窗口推导） | 超限返回 413；随热调参数自动重算 |
+| `frontend.max_tokens` | 即时回复上限（默认 256） | **可热调** |
+| `frontend.system_prompt` | 前台提示词 | **可热调** |
+| `frontend.history_budget_ratio` | 历史预算占「可用上下文 − 当前输入」的比例（默认 0.45） | **可热调**；短输入多带历史，长输入自动收紧 |
+| `frontend.history_min_chars` | 历史最小字符预算（默认 2048） | **可热调** |
+| `frontend.history_max_messages` | 历史条数上限（默认 40） | **可热调** |
+| `frontend.context_safety_tokens` | token 估算误差与模板开销预留（默认 256） | **可热调** |
+| `frontend.restart_cooldown_s` | 前台异常重启冷却（默认 30s，仅 local 前台） | 防止崩溃循环 |
+| `frontend.progress_window_s` | 进度提问关联的任务时间窗（默认 1800s） | **可热调** |
+| `openai.default_mode` / `wait_timeout_s` | OpenAI 兼容层默认模式 / final 等待上限 | **均可热调** |
 
-**环境变量覆盖**（优先级高于文件）：`SETTINGS_FILE`、`NUM_CTX`、`KV_CACHE`、`GPU_BACKEND`、`N_GPU_LAYERS`、`MAX_OUTPUT_TOKENS`、`QUEUE_MAXSIZE`、`FRONT_MAX_TOKENS`、`API_PORT`、`FRONT_PORT`、`SLOT_PORT`、`LLAMA_SERVER`、`LLAMA_LIB_DIR`、`STARTUP_TIMEOUT_S`、`REQUEST_TIMEOUT_S`、`DATA_DIR`、`LOG_DIR`、`PID_FILE`、`LOG`。
+**环境变量覆盖**（优先级高于文件与覆盖层）：`SETTINGS_FILE`、`SETTINGS_LOCAL_FILE`、`NUM_CTX`、`KV_CACHE`、`GPU_BACKEND`、`N_GPU_LAYERS`、`MAX_OUTPUT_TOKENS`、`QUEUE_MAXSIZE`、`FRONT_MAX_TOKENS`、`API_PORT`、`FRONT_PORT`、`SLOT_PORT`、`LLAMA_SERVER`、`LLAMA_LIB_DIR`、`STARTUP_TIMEOUT_S`、`REQUEST_TIMEOUT_S`、`DATA_DIR`、`LOG_DIR`、`PID_FILE`、`LOG`、`ADMIN_TOKEN`；api 槽位密钥由 `slots.<key>.api_key_env` 指定变量名。
 
-`GET /config` 会返回实际生效值，包括 `num_ctx_source`（是查表得来、文件指定还是环境变量覆盖）、每个槽位的 `devices` 与 `split_ratio`。**改完配置先看这个接口。**
+### 4.1 运行期参数热调（v2.5）
+
+**两条等价路径**：Web 控制台 `http://127.0.0.1:8100/console` →「参数调整」面板；
+或 CLI / API：
+
+```bash
+python3 cli.py config get                     # 生效配置 + 来源
+python3 cli.py config set MID_MIN_CHARS 40    # 立即生效并写入 settings.local.yaml
+python3 cli.py config reset MID_MIN_CHARS     # 恢复 settings.yaml 基础值
+python3 cli.py config overrides               # 查看覆盖层
+curl -s -X POST http://127.0.0.1:8100/admin/config -H 'Content-Type: application/json' \
+  -d '{"FRONT_MAX_TOKENS": 320}'
+curl -s -X DELETE http://127.0.0.1:8100/admin/config/FRONT_MAX_TOKENS
+```
+
+**可热调白名单**（立即生效 + 持久化到 `settings.local.yaml`，重启仍生效；
+恢复目标 = 环境变量值 > settings.yaml 原值）：
+`MID_MIN_CHARS`、`HEAVY_MIN_CHARS`、`TIER_THRESHOLDS`、`COMPLEX_WORDS`、
+`TIER_COMPLEX_WORDS`、`FRONT_MAX_TOKENS`、`FRONT_SYSTEM`、`PROGRESS_WINDOW_S`、
+`HISTORY_BUDGET_RATIO`、`HISTORY_MIN_CHARS`、`HISTORY_MAX_MESSAGES`、
+`CONTEXT_SAFETY_TOKENS`、`COMPACTION_ENABLED`、`COMPACTION_MAX_SUMMARY_CHARS`、
+`COMPACTION_MIN_DROPPED_CHARS`、`MAX_OUTPUT_TOKENS`、`REQUEST_TIMEOUT_S`、
+`OPENAI_WAIT_TIMEOUT_S`、`OPENAI_DEFAULT_MODE`。
+
+交叉校验在写入前执行（阈值递增、上下文预算不越窗），非法值返回 400 不生效。
+
+### 4.2 配置管理：启动期参数编辑与重启（v2.5.1）
+
+控制台「配置管理」面板（或 `/admin/settings`）暴露**全部启动期参数**——槽位
+（type/base_url/model/api_key_env/context_window/vram_mb/placement…）、端口、
+`num_ctx`、KV 精度、档位映射与降级链——每个字段带中文注释与来源徽标
+（settings.yaml / 覆盖层 / env）：
+
+```bash
+# 查看（含注释与来源）
+curl -s http://127.0.0.1:8100/admin/settings
+# 修改（写入覆盖层，预检通过才落盘）
+curl -s -X POST http://127.0.0.1:8100/admin/settings -H 'Content-Type: application/json' \
+  -d '{"updates": {"slots.cloud.base_url": "https://api.deepseek.com/v1"}}'
+# 移除覆盖值（恢复 settings.yaml 原值）
+curl -s -X POST .../admin/settings -d '{"resets": ["slots.cloud.base_url"]}'
+# 删除槽位（settings.yaml 来源一并删除，档位映射需同步修正否则预检拒绝）
+curl -s -X POST .../admin/settings -d '{"removes": ["slots.moe"]}'
+# 重启（先预检，预检失败不重启；前端轮询 /health 等待恢复）
+curl -s -X POST http://127.0.0.1:8100/admin/restart
+python3 cli.py restart --wait
+```
+
+**语义**：修改写入 `settings.local.yaml` 覆盖层（settings.yaml 注释不受影响），
+保存时用真实子进程导入做启动预检，非法配置（如删掉唯一 resident 槽位、
+档位映射指向已删槽位）直接拒绝且不落盘；重启后生效。换 API / 换本地模型
+的标准流程 = 配置管理改槽位字段 → 保存 → 重启服务 → `/config` 确认。
+
+`GET /config` 会返回实际生效值，包括 `num_ctx_source`、每个槽位的 `type / devices / split_ratio`（api 槽位含 `base_url` 与密钥来源）。**改完配置先看这个接口。**
 
 ## 5. 换模型（不改代码）
 
@@ -221,6 +287,16 @@ cd <工作区>
 ./run.sh status
 ./run.sh health
 ./run.sh stop            # 只停本项目 PID 与配置里的 front/slot 端口，绝不全局 pkill
+
+# CLI 等价命令（无 bash 的环境可用；仅标准库）
+python3 cli.py start --wait
+python3 cli.py status
+python3 cli.py health
+python3 cli.py stop
+python3 cli.py logs mid --tail 50
+python3 cli.py check-api cloud        # api 槽位连通性 + 试答
+python3 cli.py chat "2+2 等于几" --session demo
+python3 cli.py config validate
 ```
 
 启动会拉起 `resident: true` 的前台槽位；后台槽位**懒加载**，第一个复杂任务时才启动。
@@ -285,7 +361,10 @@ nvidia-smi / rocm-smi                    # 按实际后端
 | 重启后任务变 `failed` | 重启时任务正在处理，已标记中断 | 看 `error_msg` 是否含“服务重启”；重新提交即可，不会永久卡死 |
 | `/health.frontend=down` | 前台进程崩溃 | 下一次 `/chat` 会自动重启；若持续 down 看 `logs/front.log` 与 `slot.last_error` |
 | 日志/数据库持续增长 | 无自动轮转/清理 | 生产环境加 logrotate，定期归档或清理 `data/state.db` |
-| `/config.vram_plan.<slot>.available=false` | 显存估算装不下该槽位 | 换更小模型/量化、调 `vram_mb`，或让 heavy 自动降级；**不要强行加载** |
+| `/config.vram_plan.<slot>.available=false` | 显存估算装不下该槽位 | 换更小模型/量化、调 `vram_mb`，配置 `tier_fallbacks` 落到云端槽位，或让 heavy 自动降级；**不要强行加载** |
+| api 槽位请求失败 / `check-api` 不通 | 网络不通、密钥错误、`base_url` 缺版本段 | `python3 cli.py check-api <槽位>` 看连通性与试答；`base_url` 必须含版本段（如 `https://api.deepseek.com/v1`，缺 `/v1` 时全部 404）；密钥错时 `/health` 的 api 探测会标鉴权失败；看 `logs/<slot>.log`；前台宕机时 `/chat` 仍 200（即时回复为降级文案），后台任务标 failed 带原因 |
+| 热调参数重启后丢失 | 未持久化或被环境变量覆盖 | 看 `config overrides` 与 `/admin/config` 的来源徽标；环境变量优先级最高 |
+| 控制台 401 | 设置了 `ADMIN_TOKEN` | 请求带 `X-Admin-Token` 头（控制台会提示输入，存 localStorage） |
 | heavy 任务 `chosen_model` 是 mid | 重档显存不足，自动降级 | 正常保护；看 `selection_reason` / `release_info` 的“降级”说明 |
 | 多轮对话越来越慢 | 历史预算自动变大，prefill 变长 | 调小 `frontend.history_budget_ratio` / `history_max_messages`，或提高 `num_ctx` |
 | `ERROR: 前台槽位显存不足` | 显存不足或模型/量化过大 | 释放显存、换更小模型/量化，或调低 `vram_mb`；不要强行启动 |
@@ -316,6 +395,13 @@ BASE=http://127.0.0.1:8100 ./tests/audit_runner.sh
 
 # 单卡/小显存专项（双卡机上用 CUDA_VISIBLE_DEVICES=0 近似）
 python3 tests/audit_single_gpu.py
+
+# v2.5 新增（任意机器可跑，无需 GPU）
+python3 tests/test_api_slot.py     # api 槽位 / api 前台全链路（自起本地 fake OpenAI 服务）
+python3 tests/test_cli.py          # CLI 离线功能
+BASE=http://127.0.0.1:8100 python3 tests/test_admin_api.py   # 管理接口热调（需运行中的服务）
+OLLAMA_MODEL=qwen3.5:4b python3 tests/test_real_model_smoke.py   # 真实模型全功能冒烟（本机 Ollama）
+OLLAMA_MODEL=qwen3.5:4b python3 tests/test_truncation_behavior.py  # 截断行为（单元+真实模型）
 
 # CI
 bash tests/ci_static.sh            # 静态层：任意机器

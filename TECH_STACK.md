@@ -2,13 +2,17 @@
 
 > **English summary**: This document explains the full technology stack of `explore`, why each component was chosen, what the pinned versions are, how the layers interact, and what the compatibility matrix looks like. For the short version see [README.md](README.md); for installation see [DEPLOYMENT.md](DEPLOYMENT.md).
 >
-> **版本** v2.4.0 ｜ **更新** 2026-11-08 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
+> **版本** v2.5.0 ｜ **更新** 2026-11-14 ｜ 依赖固定清单见 [requirements.txt](requirements.txt)
+>
+> **v2.5.0 新增组件**：`app/api_backend.py`（线上 API 槽位后端，复用 httpx）；
+> `app/console.py`（单文件 Web 控制台，零依赖）；`cli.py`（Python CLI，仅标准库
+> argparse / urllib，无新增 pip 依赖）。
 
 ---
 
 ## 1. 一句话概括
 
-**Python 异步服务 + 本地 llama.cpp 推理进程 + SQLite 状态 + 单份 YAML 配置**，外加一层 ONNX 嵌入做语义线索。没有消息中间件、没有容器编排、没有系统服务、没有云依赖——所有组件都能在一台离线设备上跑起来。
+**Python 异步服务 + 推理后端（本地 llama.cpp 进程或 Ollama API）+ SQLite 状态 + 单份 YAML 配置**，外加一层嵌入做语义线索（ONNX 或 Ollama）。没有消息中间件、没有容器编排、没有系统服务、没有云依赖——所有组件都能在一台离线设备上跑起来。
 
 ---
 
@@ -22,7 +26,7 @@ flowchart TB
     end
     subgraph L1["决策层 / Decision"]
         MAIN["main.py<br/>即时回复 / 入队 / 结果回写"]
-        EMB["embed.py<br/>ONNX embedding"]
+        EMB["embed.py<br/>embedding (ONNX / Ollama)"]
         RT["router.py<br/>分级 + 互斥槽位"]
         CFG["config.py<br/>配置解析 / 预算 / vram_plan"]
         GPU["gpu.py<br/>CUDA / ROCm / CPU 探测"]
@@ -64,6 +68,10 @@ flowchart TB
 
 `app/openai_api.py` 是**协议转换层**：只做 OpenAI 两套协议与内部请求/响应之间的结构映射，不接触模型进程与数据库，因此两条入口（`/chat` 与 `/v1/*`）共用同一套编排逻辑，行为不会漂移。
 
+`app/api_backend.py` 是**线上 API 槽位后端**（v2.5）：与 `LlamaServer` 保持同一调用契约（`chat/healthy/start/stop` + `last_timings/last_finish_reason/last_error/load_ms`），但无本地进程——`chat` 是对 `base_url` 的 OpenAI 兼容 HTTP 调用。`create_backend()` 是槽位后端的唯一工厂：`type: local → LlamaServer`，`type: api → ApiBackend`，前台（main.py）与后台（SlotManager）都经由它构建。api 槽位不占显存、不参与互斥切换、与本地任务共用单队列。
+
+`app/console.py` + `cli.py` 是**运维界面层**（v2.5）：控制台是单文件内联 HTML/JS/CSS（无 CDN、无构建、离线可用），数据全部来自既有只读接口与 `/admin/config`；CLI 仅用标准库（argparse / urllib），复用 `app.config` 读端口与显存规划，写覆盖层与控制台共用同一条路径。
+
 ---
 
 ## 3. 组件清单与固定版本 / Component inventory
@@ -76,7 +84,7 @@ flowchart TB
 | HTTP 客户端 | httpx | 0.28.1 | 调用本地 `llama-server` | 原生 async、超时与连接池可控；同步库会阻塞前台即时回复 |
 | 配置 | PyYAML | 6.0.3 | 解析 `settings.yaml` | 人类可读、注释友好；配置是给人改的，不是给程序生成的 |
 | 数值 | numpy | 2.2.6 | embedding 向量归一化与计算 | ONNX Runtime 输出的数组处理 |
-| 嵌入推理 | ONNX Runtime | 1.23.2 | CPU 上跑量化 ONNX 嵌入模型 | **不占 GPU 显存**，这正是「小显存设备」的关键；无需 PyTorch 全家桶 |
+| 嵌入推理 | ONNX Runtime（onnx provider）/ Ollama embeddings API（ollama provider） | 1.23.2 / 随 Ollama | CPU 上跑量化 ONNX 嵌入模型，或调 Ollama 的 /api/embed | 均不占推理显存；ollama provider 无需 numpy/onnxruntime 依赖 |
 | 分词 | tokenizers | 0.23.3 | 嵌入模型分词 | 轻量、与 HuggingFace tokenizer.json 兼容 |
 | 状态 | SQLite（Python 标准库 `sqlite3`） | 随 Python | 会话历史 + 任务状态机 | 零部署成本、事务可靠、重启可恢复；这个项目不需要分布式存储 |
 | 并发 | `asyncio.Queue` | 标准库 | 后台任务单队列 | 串行执行使后台槽位天然互斥，不需要锁或 broker |
@@ -84,6 +92,9 @@ flowchart TB
 | GPU 探测 | `nvidia-smi` / `rocm-smi` | 系统工具 | 后端识别、卡数、显存 | 不引入 Python GPU 绑定库，跨 N 卡 / A 卡都能工作 |
 | 进程管理 | Bash + PID 文件 | — | 幂等启停 | 精确控制本项目进程，避免全局清理误伤其它服务 |
 | 测试 | pytest | 9.2.0 | 用例组织 | 与自研真机脚本并存，便于在 CI 里扩展 |
+| CLI | Python 标准库（argparse / urllib） | 随 Python | `cli.py` 服务管理 / 配置热调 / 请求调试 | 无新增 pip 依赖；无 bash 环境也能启停 |
+| Web 控制台 | 内联 HTML/JS/CSS | — | `GET /console` 单文件页面 | 无 CDN、无构建步骤、离线可用 |
+| 线上 API 槽位 | OpenAI 兼容 HTTP（httpx） | 复用 0.28.1 | `type: api` 槽位与 api 前台 | 复用既有异步 HTTP 客户端与重试语义 |
 | CI | GitHub Actions | — | 静态层 + GPU 集成层 | 静态层任意机器可跑；集成层跑带 `gpu` 标签的 self-hosted runner |
 
 > **版本固定的原因**：早期踩过「系统旧 websockets 与 Uvicorn 冲突」「tokenizers 参数不兼容导致 embedding 静默降级」两个坑。`requirements.txt` 全部用 `==` 锁定，`tests/check_portability.py` 会在 CI 静态层检查任何未固定版本的依赖行。
@@ -174,7 +185,7 @@ heavy 请求 → 自动降级到 routing.default_slot
 | 显卡数量 | 单卡 / 多卡 | 双卡全量 + 单卡（20G）阈值降级均验证 |
 | 上下文 | 最低 32K，`num_ctx: auto` 按显存查表或显式整数 | 32K / 64K / 96K 在某双卡设备各 23/23 断言通过；换设备需重测 |
 | 模型格式 | GGUF（任意量化；稠密或 MoE 均可） | 3B / 9B / 35B MoE 真机验证；换模型只改配置 |
-| 嵌入模型 | ONNX + tokenizer.json（当前中文 bge，1024 维） | 启动自检 1024 维；换模型只改 `embedding` 段 |
+| 嵌入模型 | provider: onnx（ONNX + tokenizer.json，中文 bge 1024 维）或 ollama（如 bge-m3，1024 维） | 启动自检 1024 维；换模型/切换 provider 只改 `embedding` 段 |
 | 端口 | `runtime.ports` 三个端口可配，环境变量可覆盖 | 默认 8100 / 18100 / 18101 |
 | 依赖安装 | `pip --target ./pylib`，无需 root / venv | `requirements.txt` 全部固定版本 |
 

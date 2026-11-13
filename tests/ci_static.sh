@@ -10,6 +10,7 @@ step() { echo; echo "### $*"; }
 
 step "Python 语法编译"
 python3 -m compileall -q app tests || fail=1
+python3 -m py_compile cli.py || fail=1
 
 step "Shell 语法"
 bash -n run.sh || fail=1
@@ -29,7 +30,7 @@ python3 tests/check_docs.py || fail=1
 
 step "静态检查（ruff: 语法/未定义名）"
 if command -v ruff >/dev/null 2>&1; then
-  ruff check --select E9,F63,F7,F82 app tests || fail=1
+  ruff check --select E9,F63,F7,F82 app tests cli.py || fail=1
 else
   echo "ruff 未安装，跳过（CI 中会安装）"
 fi

@@ -41,9 +41,11 @@ def run_import(settings_path, env_extra=None):
     return subprocess.run(
         [sys.executable, "-c",
          "from app import config; print('TIER_ORDER=', config.TIER_ORDER, "
-         "'FRONT=', config.FRONT_KEY, 'CTX=', config.NUM_CTX, "
+         "'FRONT=', config.FRONT_KEY, 'FRONT_TYPE=', config.FRONT_TYPE, "
+         "'CTX=', config.NUM_CTX, "
          "'BACKEND=', config.GPU_BACKEND, "
-         "'FRONT_DEVICES=', config.MODELS_META[config.FRONT_KEY]['devices'])"],
+         "'FRONT_DEVICES=', config.MODELS_META[config.FRONT_KEY]['devices'], "
+         "'TYPES=', {k: v['type'] for k, v in config.MODELS_META.items()})"],
         env=env, capture_output=True, text=True, timeout=120)
 
 
@@ -61,10 +63,10 @@ def main():
 
     check("resident_single",
           sum(1 for v in config.MODELS_META.values() if v["resident"]) == 1,
-          f"front={config.FRONT_KEY}")
-    check("tier_order_three", len(config.TIER_ORDER) == 3, config.TIER_ORDER)
+          f"front={config.FRONT_KEY} type={config.FRONT_TYPE}")
+    check("tier_order_min_three", len(config.TIER_ORDER) >= 3, config.TIER_ORDER)
     check("tier_mapping_complete",
-          all(t in config.TIER_TO_SLOT for t in config.TIER_ORDER[:3])
+          all(t in config.TIER_TO_SLOT for t in config.TIER_ORDER)
           and all(s in config.MODELS_META for s in config.TIER_TO_SLOT.values()),
           config.TIER_TO_SLOT)
     check("num_ctx_positive", config.NUM_CTX > 0,
@@ -140,8 +142,109 @@ def main():
     p = write_variant("bad_threshold", bad_threshold)
     r = run_import(p)
     check("reject_bad_threshold",
-          r.returncode != 0 and "mid_min_chars" in (r.stderr or ""),
+          r.returncode != 0
+          and ("mid_min_chars" in (r.stderr or "") or "阈值" in (r.stderr or "")),
           (r.stderr or "").strip().splitlines()[-1][:300] if r.stderr else "no error")
+
+    # ---- api 槽位：线上模型，无需本地 GGUF，显存规划恒可用 ----
+    def api_slot(d):
+        d["slots"]["moe"] = {
+            "type": "api", "base_url": "http://127.0.0.1:19199/v1",
+            "model": "remote-model", "context_window": 65536, "role": "heavy"}
+
+    p = write_variant("api_slot", api_slot)
+    r = run_import(p)
+    check("api_slot_parses",
+          r.returncode == 0 and "'moe': 'api'" in (r.stdout or "")
+          and "FRONT_TYPE= local" in (r.stdout or ""),
+          (r.stdout or r.stderr or "").strip()[:300])
+
+    def api_slot_bad_url(d):
+        api_slot(d)
+        del d["slots"]["moe"]["base_url"]
+
+    p = write_variant("api_slot_bad_url", api_slot_bad_url)
+    r = run_import(p)
+    check("reject_api_slot_without_base_url",
+          r.returncode != 0 and "base_url" in (r.stderr or ""),
+          (r.stderr or "").strip().splitlines()[-1][:300] if r.stderr else "no error")
+
+    # ---- 第 4 档：tier_thresholds 驱动；缺阈值必须 fail-fast ----
+    def four_tiers(d):
+        d["slots"]["cloud"] = {
+            "type": "api", "base_url": "http://127.0.0.1:19199/v1",
+            "model": "cloud-model", "context_window": 65536, "role": "deep"}
+        d["routing"]["tier_order"] = ["simple", "mid", "heavy", "deep"]
+        d["routing"]["tier_to_slot"] = {
+            "simple": "front", "mid": "mid", "heavy": "mid", "deep": "cloud"}
+        d["routing"]["tier_thresholds"] = {"mid": 25, "heavy": 120, "deep": 2000}
+
+    p = write_variant("four_tiers", four_tiers)
+    r = run_import(p)
+    check("four_tiers_accepted",
+          r.returncode == 0
+          and "['simple', 'mid', 'heavy', 'deep']" in (r.stdout or "")
+          and "'cloud': 'api'" in (r.stdout or ""),
+          (r.stdout or r.stderr or "").strip()[:300])
+
+    def four_tiers_no_threshold(d):
+        four_tiers(d)
+        del d["routing"]["tier_thresholds"]
+
+    p = write_variant("four_tiers_no_threshold", four_tiers_no_threshold)
+    r = run_import(p)
+    check("reject_fourth_tier_without_threshold",
+          r.returncode != 0 and "分级阈值" in (r.stderr or ""),
+          (r.stderr or "").strip().splitlines()[-1][:300] if r.stderr else "no error")
+
+    # ---- api 前台：resident 槽位允许是 api 类型 ----
+    def api_front(d):
+        d["slots"]["front"] = {
+            "type": "api", "base_url": "http://127.0.0.1:19199/v1",
+            "model": "remote-front", "context_window": 32768,
+            "role": "front", "resident": True}
+
+    p = write_variant("api_front", api_front)
+    r = run_import(p)
+    check("api_front_accepted",
+          r.returncode == 0 and "FRONT_TYPE= api" in (r.stdout or ""),
+          (r.stdout or r.stderr or "").strip()[:300])
+
+    # ---- 覆盖层 __remove__：控制台删除 settings.yaml 来源的槽位（同步修正映射）----
+    p = write_variant("overlay_remove_base", lambda d: None)
+    overlay = pathlib.Path(TMP) / "overlay_remove.local.yaml"
+    overlay.write_text(yaml.safe_dump(
+        {"slots": {"__remove__": ["moe"]},
+         "routing": {"tier_to_slot": {"heavy": "mid"},
+                     "default_slot": "mid"}},
+        allow_unicode=True, sort_keys=False),
+        encoding="utf-8")
+    r = run_import(p, {"SETTINGS_LOCAL_FILE": str(overlay)})
+    check("overlay_remove_slot",
+          r.returncode == 0 and "moe" not in (r.stdout or "").split("TYPES=")[1]
+          if "TYPES=" in (r.stdout or "") else False,
+          (r.stdout or r.stderr or "").strip()[:300])
+
+    # ---- 覆盖层删除标记必须在后续保存时保留（否则已删除的槽位会复活）----
+    code = (
+        "from app import config;"
+        "cand, err = config.build_candidate_overlay("
+        "{'runtime.queue_maxsize': 64}, [], []);"
+        "assert err is None, err;"
+        "marker = (cand.get('slots') or {}).get('__remove__');"
+        "print('MARKER=', marker)"
+    )
+    env2 = os.environ.copy()
+    env2["SETTINGS_FILE"] = str(p)
+    env2["SETTINGS_LOCAL_FILE"] = str(overlay)
+    env2["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(ROOT / "pylib")])
+    env2["DATA_DIR"] = os.path.join(TMP, "data")
+    env2["LOG_DIR"] = os.path.join(TMP, "logs")
+    r = subprocess.run([sys.executable, "-c", code], env=env2,
+                       capture_output=True, text=True, timeout=120)
+    check("overlay_remove_marker_preserved",
+          r.returncode == 0 and "['moe']" in (r.stdout or ""),
+          (r.stdout or r.stderr or "").strip()[:300])
 
     # ---- 档位改名应该可配置，而不是被代码写死 ----
     def renamed_tiers(d):

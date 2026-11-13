@@ -6,7 +6,8 @@ set -u
 
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$R" || exit 1
-export PYTHONPATH="$R/pylib:$R"
+# 前置保留调用方已有的 PYTHONPATH（与 cli.py 行为一致），避免吞掉外部环境
+export PYTHONPATH="$R/pylib:$R${PYTHONPATH:+:$PYTHONPATH}"
 
 PID_FILE="${PID_FILE:-$R/data/router.pid}"
 LOG="${LOG:-$R/logs/api.log}"
@@ -32,10 +33,14 @@ port_pid() {
 }
 
 wait_ready() {
-  local tries="${1:-120}" i
+  # 就绪等待时长与 STARTUP_TIMEOUT_S 对齐（每轮 2s + 余量），避免配置调大后
+  # 脚本提前放弃；就绪谓词用 python 解析 JSON，不依赖响应体的紧凑序列化格式
+  local tries i
+  tries="$(_cfg_port 'max(60, config.STARTUP_TIMEOUT_S // 2 + 10)')"
+  tries="${tries:-210}"
   for i in $(seq 1 "$tries"); do
     if curl -sf --max-time 3 "http://127.0.0.1:$API_PORT/health" 2>/dev/null \
-        | grep -q '"frontend":"ready"'; then
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("frontend")=="ready" else 1)' 2>/dev/null; then
       return 0
     fi
     sleep 2
@@ -75,6 +80,21 @@ case "$1" in
   stop)
     if [ -f "$PID_FILE" ]; then
       P="$(cat "$PID_FILE")"
+      # PID 归属校验：服务崩溃后 PID 可能被其它进程复用，确认 cmdline 再 kill
+      OURS=1
+      if [ -r "/proc/$P/cmdline" ]; then
+        CMD="$(tr '\0' ' ' < "/proc/$P/cmdline" 2>/dev/null)"
+        case "$CMD" in
+          *"$R"*|*uvicorn*) OURS=0 ;;
+          *) OURS=1 ;;
+        esac
+        if [ "$OURS" -ne 0 ]; then
+          echo "WARNING: pid=$P 不是本项目进程（${CMD:-unknown}），跳过 kill；删除 $PID_FILE"
+          rm -f "$PID_FILE"
+          echo "stopped"
+          exit 0
+        fi
+      fi
       kill "$P" 2>/dev/null
       for _ in $(seq 1 20); do
         kill -0 "$P" 2>/dev/null || break

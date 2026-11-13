@@ -28,7 +28,13 @@ from app import config
 problems = []
 if config.GPU_BACKEND not in ("cuda", "rocm"):
     problems.append(f"GPU 后端不可用: {config.GPU_BACKEND}")
+local_slots = [k for k, m in config.MODELS_META.items() if m.get("type") != "api"]
+if not local_slots:
+    problems.append("所有槽位都是 type: api——GPU 集成层需要至少一个 local 槽位"
+                    "（api-only 部署请改跑 tests/test_api_slot.py）")
 for key, meta in config.MODELS_META.items():
+    if meta.get("type") == "api":
+        continue    # 线上 API 槽位无本地模型文件
     if not pathlib.Path(meta["path"]).exists():
         problems.append(f"缺少模型 {key}: {meta['path']}")
 if not pathlib.Path(config.LLAMA_SERVER).exists() and "/" in config.LLAMA_SERVER:

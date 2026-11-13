@@ -3,12 +3,21 @@
 # 设计原则：
 #   1. slots 的 key 是「角色槽位」，不是某个固定模型；可增删槽位、可换任意模型/量化。
 #      其中必须有且只有一个 resident: true 的前台槽位。
-#   2. 硬件不写死：GPU 数量/品牌/后端由运行时探测，placement 决定各槽位用哪些卡。
-#   3. 环境变量仅用于部署期覆盖，优先级高于本文件（NUM_CTX / API_PORT /
+#   2. 槽位有两种形态：type: local（默认，本地 GGUF + llama-server 进程）和
+#      type: api（OpenAI 兼容线上模型，无本地显存占用，不参与互斥切换）。
+#      前台（resident: true）同样允许是 api 槽位。
+#   3. 硬件不写死：GPU 数量/品牌/后端由运行时探测，placement 决定各槽位用哪些卡。
+#   4. 运行期参数可热调：控制台（GET /console）或 CLI 会把修改写入
+#      settings.local.yaml 覆盖层（import 时深合并到本文件之上，重启仍生效；
+#      本文件的注释与结构不受影响）。环境变量优先级仍高于覆盖层。
+#   5. 环境变量仅用于部署期覆盖，优先级最高（NUM_CTX / API_PORT /
 #      FRONT_PORT / SLOT_PORT / LLAMA_SERVER / LLAMA_LIB_DIR / GPU_BACKEND /
-#      KV_CACHE / SETTINGS_FILE / STARTUP_TIMEOUT_S / REQUEST_TIMEOUT_S /
-#      DATA_DIR / LOG_DIR / QUEUE_MAXSIZE / MAX_OUTPUT_TOKENS）。
-#   4. 改模型只改本文件，不改代码；改完重启服务并跑 tests/run_matrix.sh 回归。
+#      KV_CACHE / SETTINGS_FILE / SETTINGS_LOCAL_FILE / STARTUP_TIMEOUT_S /
+#      REQUEST_TIMEOUT_S / DATA_DIR / LOG_DIR / QUEUE_MAXSIZE /
+#      MAX_OUTPUT_TOKENS / ADMIN_TOKEN；api 槽位密钥用
+#      slots.<key>.api_key_env 指定的变量名）。
+#   6. 改模型只改本文件，不改代码；改完重启服务并跑 tests/run_matrix.sh 回归。
+#      CLI 等价命令：python3 cli.py config validate / start --wait / chat "..."。
 
 version: 2
 
@@ -41,6 +50,13 @@ context:
     min_dropped_chars: 600        # 被丢弃内容少于该值时直接丢弃，不值得摘要
 
 embedding:
+  # provider: onnx（默认，本地 ONNX 嵌入模型，CPU 执行不占显存）
+  #           | ollama（用本机/远端 Ollama 的嵌入模型，如 bge-m3；无本地模型
+  #             文件、无 numpy/onnxruntime 依赖也能启用嵌入功能）
+  # 两种 provider 失败都会降级为纯文本线索，不影响主链路。
+  provider: onnx
+  ollama_url: http://127.0.0.1:11434
+  ollama_model: bge-m3
   onnx: models/embedding/fast-bge-base-zh-v1.5/onnx/model_quantized.onnx
   tokenizer: models/embedding/fast-bge-base-zh-v1.5/tokenizer.json
 
@@ -59,6 +75,17 @@ budget:
 #            explicit（用 devices 里写死的索引，仅特殊场景使用）
 # 多卡 spread 时若不写 split_ratio，比例按「各卡空闲显存 - 前台预估占用」自动计算；
 # 若设备上还有别的服务占显存导致算偏，可显式写 split_ratio: [1, 2] 之类。
+#
+# type: api 的槽位（线上 OpenAI 兼容模型）字段：
+#   base_url       API 根地址，必须包含版本段（如 https://api.deepseek.com/v1；
+#                  缺少 /v1 时所有调用都会 404）
+#   model          远端模型名（如 deepseek-chat）
+#   api_key        明文密钥（可填；推荐留空走 api_key_env）
+#   api_key_env    密钥环境变量名，优先于 api_key；密钥绝不写日志或 /config
+#   context_window 远端模型上下文窗口（tokens），用于历史预算与任务包截断
+#   max_output_tokens  可选，按槽位覆盖生成上限（缺省用 runtime.max_output_tokens）
+#   api 槽位不占本地显存：vram_plan 恒 available，不参与互斥切换；
+#   前台槽位（resident: true）同样允许 type: api（历史预算按其 context_window 计算）。
 #
 # vram_mb：权重 + KV 的目标机显存估算，按实测校准；不填则用 weight_mb*1.35+512。
 # 16G 单卡建议：front 用 3B/4B，mid 用 8B/9B Q4，moe 换成 14B Q4 或移除；
@@ -90,15 +117,33 @@ slots:
     # 分层比例默认按「各卡空闲显存 - 前台预估占用」自动计算，不需要写死。
     # 只有自动算偏时（例如卡上还有别的服务占显存）才显式写 split_ratio: [1, 2]。
     resident: false
+  # ── 线上 API 槽位示例（取消注释即可启用；密钥建议走环境变量）──
+  # cloud:
+  #   type: api
+  #   base_url: https://api.deepseek.com/v1
+  #   model: deepseek-chat
+  #   api_key_env: CLOUD_API_KEY    # export CLOUD_API_KEY=sk-...
+  #   context_window: 65536
+  #   max_output_tokens: 4096       # 可选，按槽位覆盖
+  #   role: heavy
+  #   resident: false
 
 routing:
-  # 分级名称可按需改（如 quick / standard / deep），但必须是 3 个且与下面映射一致。
-  # 代码只按顺序使用：第 1 个=直接回答，第 2 个=常规后台，第 3 个=重档后台。
+  # 分级名称可按需改（如 quick / standard / deep）；第 1 个=直接回答，
+  # 其余按 tier_thresholds 从高到低分级。第 4+ 档需要 tier_thresholds 提供阈值。
   tier_order: [simple, mid, heavy]
   tier_to_slot:                   # 档位 -> 槽位 key；增删槽位时同步改这里
     simple: front
     mid: mid
     heavy: moe
+  # tier_thresholds:               # 可选：每档触发字符数（缺省用下面的 mid/heavy_min_chars）
+  #   mid: 25
+  #   heavy: 120
+  #   deep: 2000                    # 新增档位（如云端 deep 档）必须有阈值
+  # tier_complex_words:            # 可选：每档专属强词表（命中即归入该档）
+  #   deep: ["架构设计", "完整技术方案"]
+  # tier_fallbacks:                # 可选：映射槽位不可用时的降级链（先于 default_slot）
+  #   heavy: [moe, cloud]           # moe 装不下 -> 自动落到云端槽位
   default_slot: mid
   mid_min_chars: 25
   heavy_min_chars: 120

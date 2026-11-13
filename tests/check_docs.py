@@ -16,7 +16,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = [ROOT / name for name in
         ("README.md", "OPERATIONS.md", "PROJECT_INTRO.md",
          "PROJECT_INTRO.en.md", "TECH_STACK.md", "DEPLOYMENT.md",
-         "TEST_REPORT.md", "AUDIT_REPORT.md", "ACCEPTANCE_REPORT.md")]
+         "TEST_REPORT.md", "AUDIT_REPORT.md", "ACCEPTANCE_REPORT.md",
+         "CODE_AUDIT_REPORT.md")]
 SETTINGS = ROOT / "settings.yaml"
 
 routes = set()
@@ -31,7 +32,9 @@ for node in ast.walk(tree):
             routes.add(str(dec.args[0].value))
 
 problems = []
-endpoint_rx = re.compile(r"(?<![\w/])/(chat|task_result|health|config|gpu|tasks)(?![\w/])")
+endpoint_rx = re.compile(
+    r"(?<![\w/])/(admin/config|admin/settings|admin/restart|console|chat|"
+    r"task_result|health|config|gpu|tasks)(?![\w/])")
 old_name_rx = re.compile(r"open\s*claw", re.I)
 
 with open(SETTINGS, "r", encoding="utf-8") as f:

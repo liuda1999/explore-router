@@ -98,7 +98,8 @@ def reset_inflight():
     return [r["task_id"] for r in rows]
 
 
-def create_task(task_id, session_id, user_input, tier, instant_reply, reason):
+def create_task(task_id, session_id, user_input, tier, instant_reply, reason,
+                num_ctx=None):
     now = time.time()
     with _lock, _db() as c:
         c.execute("""INSERT INTO tasks
@@ -106,7 +107,8 @@ def create_task(task_id, session_id, user_input, tier, instant_reply, reason):
              selection_reason, num_ctx, created_at, updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                   (task_id, session_id, user_input, "pending", 0, tier,
-                   instant_reply, reason, config.NUM_CTX, now, now))
+                   instant_reply, reason,
+                   config.NUM_CTX if num_ctx is None else num_ctx, now, now))
 
 
 def update_task(task_id, **kw):

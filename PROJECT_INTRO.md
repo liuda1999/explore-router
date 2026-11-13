@@ -1,8 +1,13 @@
 # explore 智能本地路由 — 项目介绍
 
-> **版本** v2.4.0 ｜ **更新** 2026-11-08 ｜ **配置驱动版**
+> **版本** v2.5.0 ｜ **更新** 2026-11-14 ｜ **配置驱动版 + 线上 API 槽位**
 > 工作区：`<部署目录>`（脚本按自身位置定位，不写死路径）
 > 双语入口：[README.md](README.md) ｜ English edition: [PROJECT_INTRO.en.md](PROJECT_INTRO.en.md)
+>
+> **v2.5.0 新增**：① 槽位支持 `type: api`（OpenAI 兼容线上模型，前台亦可）；
+> ② N 档分级（`tier_thresholds` / `tier_complex_words` / `tier_fallbacks`）；
+> ③ Web 控制台（`GET /console`）+ `/admin/config` 参数热调并持久化到
+> `settings.local.yaml`；④ Python CLI（`python3 cli.py`）。
 
 ---
 
@@ -77,7 +82,7 @@
 flowchart TD
     C[客户端 · session_id] -->|POST /chat| A[FastAPI 接口层 app/main.py]
     A --> S[(SQLite app/store.py<br/>会话历史 + 任务状态机)]
-    A --> E[ONNX Embedding app/embed.py<br/>语义拆解线索]
+    A --> E[Embedding app/embed.py<br/>语义拆解线索 ONNX / Ollama]
     A --> F[FRONT 槽位 · resident=true<br/>常驻 · 即时回复]
     F -->|简单任务| D[direct · 直接答完]
     F -->|进度提问| P[附加真实任务状态]
@@ -99,17 +104,20 @@ flowchart TD
 
 | 文件 | 职责 | 不含什么 |
 |---|---|---|
-| `app/config.py` | 读 `settings.yaml`、应用环境变量覆盖、探测后端、解析 `num_ctx`、计算历史预算与 `vram_plan`、生成槽位设备列表与分层比例、`describe()` | 不含具体模型名与 GPU 编号 |
+| `app/config.py` | 读 `settings.yaml` 与 `settings.local.yaml` 覆盖层、应用环境变量覆盖、探测后端、解析 `num_ctx`、计算历史预算与 `vram_plan`、生成槽位设备列表与分层比例、N 档阈值、`apply_runtime_params()` 热调、`describe()` | 不含具体模型名与 GPU 编号 |
 | `app/gpu.py` | 快照 GPU：后端（CUDA / ROCm / CPU）、可见卡、型号、总/空闲显存；尊重 `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` | 不含品牌判断常量 |
-| `app/llama.py` | 启动/停止 `llama-server`，端口就绪检查，运行期显存复查，`chat` 与 `/completion` 兜底，关闭 thinking，KV 精度与多卡分层参数 | 不做硬件可行性决策 |
-| `app/embed.py` | ONNX embedding 加载与推理，启动自检输出维度（当前 1024） | 不参与任务分级 |
+| `app/llama.py` | 启动/停止 `llama-server`（`type: local` 槽位），端口就绪检查，运行期显存复查，`chat` 与 `/completion` 兜底，关闭 thinking，KV 精度与多卡分层参数 | 不做硬件可行性决策 |
+| `app/api_backend.py` | **线上 API 槽位后端**（`type: api`）：OpenAI 兼容 `/chat/completions` HTTP 调用，与 LlamaServer 同一调用契约；`create_backend()` 是前后台槽位的唯一工厂 | 不做路由决策；密钥不落日志 |
+| `app/embed.py` | 嵌入推理（provider: onnx 本地 ONNX / ollama 远端嵌入如 bge-m3），启动自检输出维度（1024）；失败降级为纯文本线索 | 不参与任务分级 |
 | `app/store.py` | SQLite `messages` / `tasks`；合并连续同角色消息、按预算截断并规范化历史、任务状态机、重启恢复 | 无跨会话检索层 |
-| `app/router.py` | 分级、`tier_to_slot` 映射、静态 `VRAM_PLAN` 选槽/降级、后台槽位互斥 `ensure()` | 不假设恰好三个槽位 |
+| `app/router.py` | N 档分级（`tier_thresholds` / 每档词表）、`tier_to_slot` 映射与 `tier_fallbacks` 降级链、静态 `VRAM_PLAN` 选槽、后台槽位互斥 `ensure()`（api 槽位直接复用客户端） | 不假设槽位数量与后端形态 |
 | `app/prompts.py` | **统一消息模板**：后台 system、任务包、结果/进度前缀、截断标记、降级文案；`PROMPT_VERSION` 标识版本 | 不参与路由决策，不读配置 |
 | `app/compaction.py` | **上下文压缩**：摘要器人格、滚动合并模板、内容哈希缓存键、摘要注入前缀 | 不决定裁剪预算，不写数据库 |
 | `app/openai_api.py` | **OpenAI 协议转换**：chat/completions 与 Responses 的请求解析、响应/SSE 帧、模型列表、错误体 | 不接触模型进程与数据库 |
-| `app/main.py` | FastAPI 接口、即时回复、进度附注、任务入队、worker、结果原样写回、`context_usage`、错误码 | 不含业务逻辑以外的硬件逻辑 |
-| `run.sh` | 幂等启停，按脚本位置定位工作区，端口从配置读取，启动前显存预检 | 不写死路径、不做全局 `pkill` |
+| `app/main.py` | FastAPI 接口、即时回复、进度附注、任务入队、worker、结果原样写回、`context_usage`、错误码、`/console`、`/admin/config` 热调端点 | 不含业务逻辑以外的硬件逻辑 |
+| `app/console.py` | **Web 控制台**：单文件 HTML/JS/CSS（无 CDN、离线可用），总览 / 参数热调 / 配置管理 / 槽位显存 / 任务 / 对话试用六个面板 + 一键重启 | 只做接口薄视图，无业务逻辑 |
+| `cli.py` | **Python CLI**：start/stop/status/health、config get/set/reset/validate、chat、task/tasks/models、logs、check-api；仅标准库 | 不写死路径与端口 |
+| `run.sh` | 幂等启停，按脚本位置定位工作区，端口从配置读取，启动前显存预检（api 前台自动跳过） | 不写死路径、不做全局 `pkill` |
 
 **分层原则**：`gpu.py` 只观测 → `config.py` 只决策 → `llama.py` 只执行。任何一层都不需要知道另一台设备长什么样。
 
@@ -146,7 +154,7 @@ flowchart TD
 | 后台结果（历史） | `prompts.history_message()` | `[后台结果] ` + 原始输出 | 是 |
 | 进度附注 | `prompts.progress_note()` | `[后台任务进度] ` + 真实任务状态 | 否（只进即时回复） |
 | 前台降级 | `prompts.front_failure()` | 固定句式，含异常类型，不含堆栈 | 是（作为干净回复） |
-| 超长输入 | `prompts.TRUNCATION_MARK` | 保留首 2/3、尾 1/3，中间标记截断 | 否（仅任务包） |
+| 超长输入 | `prompts.TRUNCATION_MARK` | 按段落/句子边界保留完整单元（头部 2/3 + 尾部，中间以标记省略并注明省略数量） | 否（仅任务包） |
 | 历史截断提示 | `prompts.HISTORY_TRUNCATED_NOTE` | 固定提示：更早记录不可用，禁止用其它轮次替代或猜测 | 否（只进 system） |
 
 三条硬约束：
@@ -187,16 +195,18 @@ flowchart TD
 | 段 | 作用 | 关键点 |
 |---|---|---|
 | `runtime` | 运行时二进制、库目录、后端偏好、端口、超时、限额 | `n_gpu_layers` / `max_output_tokens` / `queue_maxsize` 均可配 |
-| `context` | `num_ctx`、`kv_cache`、`auto_table` | 最低 32K；`auto` 按设备总显存查表，也可写整数 |
+| `context` | `num_ctx`、`kv_cache`、`auto_table`、`compaction` | 最低 32K；`auto` 按设备总显存查表，也可写整数 |
 | `embedding` | ONNX 与 tokenizer 路径 | 换嵌入模型只改这里 |
 | `budget` | 系统显存预留与安全余量 | 装不下时标记不可用，不强行加载 |
-| `slots` | **角色槽位字典** | `model / quant / weight_mb / vram_mb / placement / split_ratio / resident`；必须且仅有一个 `resident: true` |
-| `routing` | `tier_order`、`tier_to_slot`、分级阈值、复杂词表、输入上限 | 增删槽位、改档位名/映射只改这里 |
-| `frontend` | 前台提示词、回复上限、**自动历史预算**、重启冷却、进度时间窗 | 历史按 `num_ctx` 自动伸缩，不写死条数 |
+| `slots` | **角色槽位字典** | `type`（local/api）、`model / quant / weight_mb / vram_mb / placement / split_ratio / resident`；api 槽位另有 `base_url / api_key / api_key_env / context_window / max_output_tokens`；必须且仅有一个 `resident: true`（local 或 api 均可） |
+| `routing` | `tier_order`、`tier_to_slot`、`tier_thresholds`、`tier_complex_words`、`tier_fallbacks`、分级阈值、复杂词表、输入上限 | 3+ 档；第 4+ 档必须给 `tier_thresholds`；增删槽位、改档位名/映射只改这里 |
+| `frontend` | 前台提示词、回复上限、**自动历史预算**、重启冷却、进度时间窗 | local 前台历史预算按 `NUM_CTX`，api 前台按其 `context_window` |
 
-**环境变量（部署期覆盖，优先级最高）**：`SETTINGS_FILE`、`NUM_CTX`、`KV_CACHE`、`GPU_BACKEND`、`N_GPU_LAYERS`、`MAX_OUTPUT_TOKENS`、`QUEUE_MAXSIZE`、`FRONT_MAX_TOKENS`、`API_PORT`、`FRONT_PORT`、`SLOT_PORT`、`LLAMA_SERVER`、`LLAMA_LIB_DIR`、`STARTUP_TIMEOUT_S`、`REQUEST_TIMEOUT_S`、`DATA_DIR`、`LOG_DIR`、`PID_FILE`、`LOG`。
+**两层配置加载**：`settings.yaml`（手编，注释保留）→ `settings.local.yaml` 覆盖层（控制台 / CLI 热调写入，import 时深合并，重启仍生效）→ 环境变量（优先级最高）。
 
-`GET /config` 返回**实际生效**的配置：探测出的后端与卡数、`num_ctx_source`（查表 / 文件 / 环境变量）、各槽位 `devices` 与 `split_ratio`、`vram_plan` 的可用性与原因。**换模型或换设备后第一步就是看它。**
+**环境变量（部署期覆盖，优先级最高）**：`SETTINGS_FILE`、`SETTINGS_LOCAL_FILE`、`NUM_CTX`、`KV_CACHE`、`GPU_BACKEND`、`N_GPU_LAYERS`、`MAX_OUTPUT_TOKENS`、`QUEUE_MAXSIZE`、`FRONT_MAX_TOKENS`、`API_PORT`、`FRONT_PORT`、`SLOT_PORT`、`LLAMA_SERVER`、`LLAMA_LIB_DIR`、`STARTUP_TIMEOUT_S`、`REQUEST_TIMEOUT_S`、`DATA_DIR`、`LOG_DIR`、`PID_FILE`、`LOG`、`ADMIN_TOKEN`（设置后 `/admin` 写操作需 `X-Admin-Token` 头）；api 槽位密钥用 `slots.<key>.api_key_env` 指定的变量名。
+
+`GET /config` 返回**实际生效**的配置：探测出的后端与卡数、`num_ctx_source`（查表 / 文件 / 环境变量）、各槽位 `type / devices / split_ratio`（api 槽位含 `base_url` 与密钥来源，不含密钥本体）、`tier_thresholds`、`vram_plan` 可用性与原因。**换模型或换设备后第一步就是看它。**
 
 启动时配置会做 fail-fast 校验：缺前台槽位、多个 `resident: true`、映射指向不存在的槽位、分级阈值顺序错误、档位名数量不符，都会直接报错退出，而不是带病运行。
 
@@ -221,7 +231,9 @@ slots:
 |---|---|---|
 | 换前台（3B ↔ 4B、换量化） | `front.model` / `quant` / `weight_mb` / `vram_mb` | 否 |
 | 换中档 / 重档（8B ↔ 9B、30B/35B MoE ↔ 稠密模型） | 对应槽位同上 | 否 |
-| 增减槽位 / 改档位名 | `slots` + `routing.tier_to_slot`（+ `tier_order`） | 否 |
+| **换线上 API / 增加云端槽位（v2.5）** | 新增 `type: api` 槽位（`base_url / model / api_key_env / context_window`），`tier_to_slot` 或 `tier_fallbacks` 指向它 | 否 |
+| **前台换成线上模型（v2.5）** | 前台槽位改 `type: api`，`context_window` 填远端窗口 | 否 |
+| 增减槽位 / 改档位名 / 增删档位 | `slots` + `routing.tier_to_slot`（+ `tier_order` / `tier_thresholds`） | 否 |
 | 换推理运行时 | `runtime.server_bin` / `lib_dir` | 否（接口隔离在 `app/llama.py`） |
 | 换嵌入模型 | `embedding.onnx` / `tokenizer` | 否 |
 | 换设备（单卡 A 卡 / 单卡 N 卡 / 多卡 / 无 GPU） | `gpu_backend: auto` 已足够，必要时调 `placement` 与 `vram_mb` | 否 |
@@ -281,12 +293,16 @@ history_budget  = max(history_min_chars, (available - len(current_input)) * hist
 |---|---|
 | `POST /chat` | 请求 `{user_input, session_id?, prefer_tier?}`；返回 `instant_reply`、`process_mode`、`task_id`、`num_ctx`、`queue_position`、`context_usage` 等 |
 | `POST /v1/chat/completions` | OpenAI 兼容；标准请求进，标准响应或 SSE 出 |
-| `GET /v1/models` | 虚拟模型名：`explore`（自动）、`explore-fast`（只回即时回复）、`explore-<tier>` |
+| `GET /v1/models` | 虚拟模型名：`explore`（自动）、`explore-fast`（只回即时回复）、`explore-<tier>`（含新增档位，自动出现） |
 | `GET /task_result` | 状态、进度、`final_reply`（原样）、所选槽位、真实 prefill 耗时、错误信息 |
-| `GET /health` | 后端、`num_ctx`、前台、槽位、队列、embedding（启动自检 1024 维）、显存、`config` 摘要 |
+| `GET /health` | 后端、`num_ctx`、前台（local/api）、槽位、队列、embedding（启动自检 1024 维）、显存、`config` 摘要 |
 | `GET /config` | **当前生效配置**（换模型/换设备后必看） |
 | `GET /gpu` | 各卡型号 / 显存 / 驱动 |
 | `GET /tasks` | 最近任务（`limit` 1–200） |
+| `GET /console` | **内置 Web 控制台**（v2.5：总览 / 参数热调 / 配置管理 / 槽位显存 / 任务 / 对话试用 + 一键重启） |
+| `GET/POST/DELETE /admin/config` | **参数热调**（v2.5）：GET 生效配置与热调元数据；POST `{参数: 值}` 立即生效并持久化到 `settings.local.yaml`；DELETE 恢复基础值。设 `ADMIN_TOKEN` 后写操作需 `X-Admin-Token` 头 |
+| `GET/POST /admin/settings` | **配置管理**（v2.5.1）：GET 全量启动期配置编辑视图（每个字段带中文注释 / 当前值 / 来源徽标）；POST `{updates, resets, removes}` 写覆盖层（改槽位模型/API/端口等），保存前真实导入预检，重启后生效 |
+| `POST /admin/restart` | **一键重启**（v2.5.1）：先配置预检（起不来就拒绝重启），再优雅退出并由守护子进程以相同参数拉起新实例；前端轮询 `/health`（`started_at` 变化）确认恢复 |
 
 **错误约定**：空输入 `400`；超长输入 `413`（`routing.max_input_chars`）；非法 `prefer_tier` `400`；队列满 `429`（`runtime.queue_maxsize`）；任务不存在返回 `code=404`。`/v1/*` 使用 OpenAI 错误体 `{"error":{message,type,param,code}}`，后台失败返回 `502`。
 
@@ -380,6 +396,9 @@ GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)�
 | 决策 | 原因 | 边界 |
 |---|---|---|
 | 配置驱动槽位与硬件 | 换模型、换设备不改代码 | 改配置后需重启并回归 |
+| **槽位支持 type: api（v2.5）** | 云端模型作为档位目标 / 新增档位 / 本地降级备选；不占显存、无切换成本 | 依赖外部服务可用性与网络延迟；密钥经环境变量管理 |
+| **运行期参数热调 + 覆盖层（v2.5）** | 阈值/词表/输出上限等调参免重启；`settings.local.yaml` 保留 settings.yaml 注释 | 槽位/模型/端口/num_ctx 仍是启动期参数 |
+| **共用单队列（api 槽位不并发）（v2.5）** | 槽位互斥/单 worker 架构不变，改动最小 | 云端任务与本地任务串行排队 |
 | 前台常驻 + 后台单槽位 | 同时成立「始终交互」与「上下文连续」 | 后台任务串行 |
 | 短任务包而非完整会话 | 主会话归前台，后台是无状态执行器 | 后台看不到完整历史 |
 | 关闭 thinking | 部分 GGUF 把正文写进 `reasoning_content`，导致 `content` 为空 | `chat_template_kwargs` + `/completion` 兜底 |
@@ -411,6 +430,7 @@ GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)�
 
 ## 15. 已知限制与边界
 
+- **api 槽位（v2.5）依赖外部服务**：可用性、延迟与计费由云服务商决定；密钥经环境变量注入，服务端不落日志；`context_window` 是远端模型的声明值，历史预算按它估算，需按真实模型校准。
 - **模型质量**：中档 9B 在示例配置下常回 15–22 字、偶有复述输入；35B MoE 对「各一句」类要求也只回 20 余字。这是所选模型的质量问题，换更强模型或调提示词/输出要求即可，不影响链路。
 - **轻量前台指令遵循弱**：进度信息由 API 层附加真实状态保障；回读后台结果时偶发编造「处理中」，**以 `final_reply` 为准**。
 - **`num_ctx: auto` 是启发式查表**，不是精确显存求解；新设备建议实测校准 `auto_table`。
@@ -419,7 +439,7 @@ GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)�
 - **`vram_mb` 是「权重 + KV」估算值**，需按目标机实测校准；偏差过大可能误判可用性。
 - **压缩后仍有信息损失**：预算外的轮次不再直接丢弃——开启 `context.compaction` 时会滚动摘要保留，暗号/编号要求逐字复制，真机实测可召回第一轮标记。但摘要终究是压缩产物，仍可能漏项或轻微失真；需要精确回溯时应由客户端保留原始记录。关闭压缩（或摘要失败）时退回旧行为：丢弃 + `history_truncated` 标记，轻量前台仍可能误答更早轮次。
 - **无流式输出**；长任务需轮询 `/task_result`。
-- **无鉴权、无速率限制**；默认绑 `127.0.0.1`，对外必须加反向代理与鉴权、TLS。
+- **无鉴权、无速率限制**；默认绑 `127.0.0.1`，对外必须加反向代理与鉴权、TLS（设 `ADMIN_TOKEN` 可保护 `/admin` 写操作）。
 - **日志与 SQLite 无自动轮转/清理**，长期运行需外部 logrotate 与定期归档。
 - **未做小时级压测 / 显存泄漏测试**；CPU-only 未跑全量功能。
 - 历史报告中的性能数据只对应那一台设备；不是 SLA。
@@ -450,6 +470,7 @@ GitHub Actions 定义在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)�
 | [DEPLOYMENT.md](DEPLOYMENT.md) | 部署与启动流程、硬件场景、验收清单 |
 | [OPERATIONS.md](OPERATIONS.md) | 日常运维、换模型/换设备、监控、排障、回滚 |
 | [AUDIT_REPORT.md](AUDIT_REPORT.md) | 全量审计与 CI 实测（真机、无 mock） |
+| [CODE_AUDIT_REPORT.md](CODE_AUDIT_REPORT.md) | v2.5.0 代码审计（安全/并发/跨平台 28 项修复 + 无 GPU 全链路） |
 | [TEST_REPORT.md](TEST_REPORT.md) | 特定设备的历史实测（带设备相关性声明） |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | 历史开发记录（需求演进，非当前约束） |
 | [settings.yaml](settings.yaml) | **唯一配置源** |

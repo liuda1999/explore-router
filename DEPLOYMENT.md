@@ -1,8 +1,8 @@
 # explore 智能本地路由 — 部署与启动流程
 
-> **English summary**: A complete, device-agnostic deployment runbook — prerequisites, the exact startup sequence, three hardware scenarios (multi-GPU NVIDIA / single AMD / small-VRAM single card), environment overrides, a first-boot acceptance checklist, regression commands, failure triage, upgrade/rollback, and CI wiring. Short version in [README.md](README.md); component rationale in [TECH_STACK.md](TECH_STACK.md).
+> **English summary**: A complete, device-agnostic deployment runbook — prerequisites, the exact startup sequence, hardware scenarios (multi-GPU NVIDIA / single AMD / small-VRAM single card / online-API slots), environment overrides, a first-boot acceptance checklist, regression commands, failure triage, upgrade/rollback, and CI wiring. Short version in [README.md](README.md); component rationale in [TECH_STACK.md](TECH_STACK.md).
 >
-> **版本** v2.4.0 ｜ **更新** 2026-11-08
+> **版本** v2.5.0 ｜ **更新** 2026-11-14
 > **核心原则**：不写死路径、不装系统服务、不设开机自启、不污染系统 Python 环境。
 
 ---
@@ -61,7 +61,7 @@ flowchart LR
 | 前台 GGUF | 1 个 | `models/` | 轻量 Instruct（3B/4B 小量化）；`resident: true` |
 | 中档 GGUF | 1 个 | `models/` | 8B/9B 等，可换成任意模型 |
 | 重档 GGUF | 1 个 | `models/` | 30B/35B MoE 或稠密模型；小显存设备可移除该槽位 |
-| ONNX 嵌入模型 + tokenizer | 1 套 | `models/embedding/...` | 当前中文 bge，1024 维，CPU 执行 |
+| 嵌入模型 | 1 套（或无） | ONNX 放 `models/embedding/...`；或 `embedding.provider: ollama`（先 `ollama pull bge-m3`，无需本地文件） | 语义线索用，失败自动降级不影响主链路 |
 
 > 模型文件与权重**不进 git**（`.gitignore` 已排除 `*.gguf` / `*.onnx`）。仓库只包含路径配置。
 
@@ -74,7 +74,8 @@ explore-router/
 ├── settings.yaml          ★ 唯一配置源：槽位 / 模型 / 硬件 / 上下文 / 端口
 ├── requirements.txt       固定版本依赖
 ├── run.sh                 幂等启停（路径按脚本位置，端口读配置）
-├── app/                   服务实现（config / gpu / llama / embed / store / router / main）
+├── app/                   服务实现（config / gpu / llama / api_backend / embed / store / router / main / console）
+├── cli.py                 Python CLI（run.sh 的跨平台等价物）
 ├── tests/                 回归 + 审计 + CI 脚本
 ├── .github/workflows/     GitHub Actions
 ├── models/                GGUF 与 ONNX（自行放置，不入库）
@@ -134,15 +135,20 @@ models/embedding/fast-bge-base-zh-v1.5/tokenizer.json
 | `runtime.server_bin` / `lib_dir` | `llama-server` 二进制与其动态库目录 | 路径写错 → 启动失败，看 `logs/<slot>.log` |
 | `runtime.gpu_backend` | `auto`（推荐）或显式 `cuda` / `rocm` / `cpu` | 探测不到 GPU 时 `/config` 会显示 `cpu` |
 | `runtime.ports` | 三个空闲端口 | `start` 会检查端口占用并明确报错，不要用全局清理 |
-| `slots.*.model` | 你的 GGUF 相对路径 | 相对工作区根目录 |
-| `slots.*.vram_mb` | **目标机实测**的权重 + KV 显存 | 不填则按 `weight_mb*1.35+512` 粗估，可能误判 |
+| `slots.*.type` | `local`（默认）或 `api` | `api` 槽位不填本地 model 文件，填 `base_url` / `model` |
+| `slots.*.model` | 你的 GGUF 相对路径（api 槽位填**远端模型名**） | 相对工作区根目录 |
+| `slots.*.base_url` / `api_key_env` | api 槽位的 API 根地址与密钥环境变量名 | 密钥本体放环境变量，不要提交进配置文件 |
+| `slots.*.context_window` | api 槽位的远端模型窗口（tokens） | 影响历史预算与任务包截断，按真实模型填 |
+| `slots.*.vram_mb` | **目标机实测**的权重 + KV 显存（仅 local 槽位） | 不填则按 `weight_mb*1.35+512` 粗估，可能误判 |
 | `slots.*.placement` | 单卡用 `auto`；多卡大模型可 `spread` | 单卡写了 `spread` 会自动退化，不会报错 |
 | `slots.*.split_ratio` | 可选，多卡分层比例 | **换设备时删掉这行**，让程序按空闲显存自动算 |
-| `slots.front.resident` | `true`，且全文件仅一个 `true` | 缺失或多个 → 启动直接失败 |
+| `slots.front.resident` | `true`，且全文件仅一个 `true` | 缺失或多个 → 启动直接失败；前台允许是 api 槽位 |
 | `context.num_ctx` | `auto` 或整数（最低 32K） | `auto` 按 `auto_table` 查表，表可编辑 |
 | `context.auto_table` | 按目标机显存校准 | 新设备建议实测后调整 |
-| `routing.tier_to_slot` | 档位 → 槽位 key | 增删槽位时同步改；指向不存在的槽位会启动失败 |
-| `embedding.onnx` / `tokenizer` | 你的嵌入模型路径 | 启动自检会输出维度；为 0 时看 `/health` 的 `embedding.error` |
+| `routing.tier_to_slot` | 档位 → 槽位 key | 所有档位都必须有映射；指向不存在的槽位会启动失败 |
+| `routing.tier_thresholds` | 3+ 档时第 4+ 档的触发字符数 | 新增档位缺阈值 → 启动直接失败 |
+| `routing.tier_fallbacks` | 可选，档位降级链（如 `heavy: [moe, cloud]`） | 槽位必须存在；映射槽位不可用时按序尝试 |
+| `embedding.onnx` / `tokenizer` | 你的嵌入模型路径 | 启动自检会输出维度；失败为非致命降级（`/health` 的 `embedding.error`） |
 
 配置会在启动时 fail-fast 校验：缺前台、多个 `resident: true`、档位名数量不符、映射不存在、分级阈值顺序错误，都会立即报错退出。
 
@@ -302,6 +308,31 @@ python3 tests/audit_single_gpu.py
 
 探测不到 GPU 时后端标为 `cpu`，不设置可见设备变量，交给运行时。`n_gpu_layers` 会被运行时忽略。CPU-only 未跑全量功能，仅完成探测与显式设备越界检查。
 
+### 4.5 线上 API 槽位（v2.5，任意硬件）
+
+槽位声明 `type: api` 后走 OpenAI 兼容云端模型，不占本地显存——**没有 GPU / 显卡很小的机器同样能部署完整链路**：
+
+```yaml
+slots:
+  front: {model: models/3b-q4.gguf, vram_mb: 3200, resident: true}
+  moe:  {model: models/moe35b-q4.gguf, vram_mb: 26000, placement: spread}
+  cloud:
+    type: api
+    base_url: https://api.deepseek.com/v1
+    model: deepseek-chat
+    api_key_env: CLOUD_API_KEY      # export CLOUD_API_KEY=sk-...
+    context_window: 65536
+    role: heavy
+routing:
+  tier_fallbacks: {heavy: [moe, cloud]}   # moe 装不下自动落云端
+```
+
+要点：
+- **密钥**：`api_key_env` 指定环境变量名（推荐），或 `api_key` 明文（不提交 git）；密钥不出现在日志与 `/config`；
+- **前台也可以是 api 槽位**（`resident: true` + `type: api`）：历史预算按其 `context_window` 计算，服务启动不因云端暂时不可用而失败；
+- **互斥语义不变**：api 槽位不参与本地互斥切换，与本地任务共用单队列；
+- **验收**：`/config` 看 `slots.<key>.type=api` 与 `vram_plan` 恒可用；`python3 cli.py check-api <key>` 做连通性测试与单轮试答；`tests/test_api_slot.py` 在任意机器走完整链路（自起本地 fake OpenAI 服务，无需真实密钥）。
+
 ---
 
 ## 5. 环境变量覆盖 / Environment overrides
@@ -318,6 +349,8 @@ python3 tests/audit_single_gpu.py
 | `LLAMA_SERVER` / `LLAMA_LIB_DIR` | 运行时二进制 / 动态库目录 |
 | `STARTUP_TIMEOUT_S` / `REQUEST_TIMEOUT_S` | 启动 / 请求超时 |
 | `DATA_DIR` / `LOG_DIR` / `PID_FILE` / `LOG` | 数据 / 日志 / PID / 日志文件 |
+| `SETTINGS_LOCAL_FILE` | 运行期参数覆盖层路径（默认 settings.yaml 同目录的 `settings.local.yaml`） |
+| `ADMIN_TOKEN` | 设置后 `/admin` 写操作需 `X-Admin-Token` 头 |
 
 示例：
 
@@ -423,10 +456,10 @@ tar -czf ~/explore-router-backup.tgz -C <工作区> \
 ## 10. 部署纪律 / Operational rules
 
 - **不写死路径**：工作区路径只由 `run.sh` 自身位置决定；模型/运行时路径只在 `settings.yaml`。
-- **不装系统服务、不设开机自启**：服务只在主动 `start` 后存在。
+- **不装系统服务、不设开机自启**：服务只在主动 `start` 后存在（`./run.sh` 与 `python3 cli.py` 均可）。
 - **不做全局清理**：禁止 `pkill -9 python`、禁止清运行时缓存；只用 PID 文件与配置端口管理。
-- **不提交凭据与权重**：`.gitignore` 已排除 `.env`、私钥、`*.gguf`、`*.onnx`、日志、数据库。
-- **默认只绑 `127.0.0.1`**：对外暴露必须加反向代理与鉴权、TLS；当前无鉴权、无速率限制。
+- **不提交凭据与权重**：`.gitignore` 已排除 `.env`、私钥、`*.gguf`、`*.onnx`、日志、数据库、`settings.local.yaml`。
+- **默认只绑 `127.0.0.1`**：对外暴露必须加反向代理与鉴权、TLS；当前无鉴权、无速率限制（设 `ADMIN_TOKEN` 可保护 `/admin` 写操作）。
 - **长期运行**：外部配置 logrotate，定期归档 `data/state.db`。
 
 ---

@@ -1,23 +1,33 @@
 """explore 智能本地路由（配置驱动版）。
 
 前台：由 settings.yaml 中 resident=true 的槽位常驻，句句有着落、即时回复、
-      简单任务直接完成、进度应答；前台进程异常时自动重启一次。
-后台：互斥槽位，默认常驻一个模型，需要另一档时才切换；结果原样递回。
-配置：槽位、模型、硬件、上下文、端口、限额全部来自 settings.yaml。
+      简单任务直接完成、进度应答；本地前台进程异常时自动重启一次，
+      api 前台（线上模型）无进程，连通性由调用本身兜底。
+后台：本地互斥槽位默认常驻一个模型，需要另一档时才切换；type: api 槽位
+      指向 OpenAI 兼容线上模型，无显存约束、不参与互斥切换；结果原样递回。
+配置：槽位（local/api）、模型、硬件、上下文、端口、限额全部来自 settings.yaml；
+      运行期参数可经 /admin/config 热调并持久化到 settings.local.yaml。
 状态：SQLite 持久化；重启时恢复未完成任务，processing 标记失败避免卡死。
 """
 import asyncio
+import copy
+import json
+import os
+import signal
+import subprocess
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import compaction, config, gpu, openai_api, prompts, store
+from .api_backend import create_backend
+from .console import console_page
 from .embed import EmbeddingProvider
-from .llama import LlamaServer
 from .router import SlotManager, classify, slot_for_tier
 
 # 强进度词：明确在问任务状态；弱进度词：需要同时存在进行中的任务才算进度提问
@@ -25,20 +35,36 @@ STRONG_PROGRESS_WORDS = ("进度", "到哪了", "到哪一步", "完成了吗", 
                          "处理完", "还在吗", "status")
 WEAK_PROGRESS_WORDS = ("好了吗", "怎么样了", "怎么样")
 
-front: LlamaServer | None = None
+# 设了 ADMIN_TOKEN 时，POST/DELETE /admin/* 需带 X-Admin-Token 头（GET 不限）
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+front = None        # LlamaServer（local 槽位）或 ApiBackend（api 槽位），由工厂创建
 slot: SlotManager | None = None
 embedding: EmbeddingProvider | None = None
 queue: asyncio.Queue | None = None
 worker_task = None
 front_lock = asyncio.Lock()
+# 前台实例被即时回复与压缩摘要并发调用；串行化避免 last_finish_reason/last_timings
+# 共享属性被交叉覆写（正文内容不受影响，元数据会张冠李戴）
+front_chat_lock = asyncio.Lock()
+# 每会话压缩锁：同会话并发请求不重复摘要、covered_messages 不回退
+_compact_locks: dict[str, asyncio.Lock] = {}
 front_last_restart = 0.0
+# /admin/restart 防重入：守护子进程已派出后拒绝再次重启
+RESTARTING = False
 
 
 async def ensure_front():
-    """前台是常驻交互入口：不健康时重启一次，冷却期内不反复重启。"""
+    """前台是常驻交互入口：本地进程不健康时重启一次，冷却期内不反复重启。
+
+    api 前台没有进程可重启，直接放行——连通性问题由 chat 调用本身暴露，
+    失败走 prompts.front_failure 降级文案，不影响请求返回。
+    """
     global front_last_restart
     if front is None:
         return False
+    if config.FRONT_TYPE == "api":
+        return True
     if await front.healthy():
         return True
     async with front_lock:
@@ -80,21 +106,20 @@ async def process_task(task_id):
                               release_info=(f"slot switched; load {server.load_ms}ms"
                                             f"{degrade_note}"))
         # 短任务包：只给后台模型必要信息，不灌完整会话历史
-        # 超长输入按上下文预算截断中间部分，避免后台实例 prefill 溢出
-        task_text = t["user_input"]
-        task_limit = max(512, config.NUM_CTX - config.MAX_OUTPUT_TOKENS
-                         - config.CONTEXT_SAFETY_TOKENS)
-        truncated = len(task_text) > task_limit
-        if truncated:
-            head = task_limit * 2 // 3
-            tail = task_limit - head
-            task_text = (task_text[:head] + prompts.TRUNCATION_MARK
-                         + task_text[-tail:])
+        # 超长输入按「该槽位」的上下文预算截断（api 槽位用自己的窗口）；
+        # 截断策略：按段落/句子边界保留完整单元，切点不落在半句话上
+        task_text, truncated = prompts.truncate_for_task(
+            t["user_input"],
+            max(512, config.slot_ctx(slot_key)
+                - config.slot_max_tokens(slot_key)
+                - config.CONTEXT_SAFETY_TOKENS))
         # 统一模板：system + user 两条，字段顺序固定，见 app/prompts.py
-        messages = prompts.backend_messages(
-            task_text, embedding.split(task_text), truncated=truncated)
+        # 嵌入可能是同步 HTTP（ollama provider）：放线程池避免阻塞事件循环
+        clues = await asyncio.to_thread(embedding.split, task_text)
+        messages = prompts.backend_messages(task_text, clues, truncated=truncated)
         store.update_task(task_id, progress=50, release_info=f"{slot_key} 正在生成")
-        reply = await server.chat(messages, max_tokens=config.MAX_OUTPUT_TOKENS,
+        reply = await server.chat(messages,
+                                  max_tokens=config.slot_max_tokens(slot_key),
                                   temperature=0.3)
         elapsed = round((time.time() - t0) * 1000, 1)
         timings = server.last_timings or {}
@@ -142,13 +167,14 @@ async def lifespan(app):
     global front, slot, embedding, queue, worker_task, front_last_restart
     store.init()
     embedding = EmbeddingProvider()
-    if not config.VRAM_PLAN.get(config.FRONT_KEY, {}).get("available", True):
+    # 显存门槛只约束本地前台；api 前台无显存占用，探测失败也不阻断启动
+    if (config.FRONT_TYPE == "local"
+            and not config.VRAM_PLAN.get(config.FRONT_KEY, {}).get("available", True)):
         raise RuntimeError(
             f"前台槽位 {config.FRONT_KEY} 显存不足: "
             f"{config.VRAM_PLAN[config.FRONT_KEY]['reason']}")
     fm = config.MODELS_META[config.FRONT_KEY]
-    front = LlamaServer(config.FRONT_KEY, config.FRONT_PORT, config.FRONT_MODEL,
-                        fm["devices"], split_ratio=fm["split_ratio"])
+    front = create_backend(config.FRONT_KEY, fm, config.FRONT_PORT)
     await front.start()
     slot = SlotManager()
     queue = asyncio.Queue(maxsize=max(0, config.QUEUE_MAXSIZE))
@@ -172,7 +198,7 @@ async def lifespan(app):
     await front.stop()
 
 
-app = FastAPI(title="explore 智能本地路由", version="2.4.0", lifespan=lifespan)
+app = FastAPI(title="explore 智能本地路由", version="2.5.0", lifespan=lifespan)
 STARTED_AT = int(time.time())
 
 
@@ -199,7 +225,7 @@ def _base_resp(text, session_id, task_id, tier, mode, instant, reason, status,
         # stop = 正常结束；length = 撞到 max_tokens，内容被截断
         "finish_reason": finish_reason,
         "status": "success",
-        "num_ctx": config.NUM_CTX,
+        "num_ctx": config.FRONT_NUM_CTX,
         "selection_reason": reason,
         "queue_position": queue_position,
         "context_usage": context or {},
@@ -224,7 +250,7 @@ def _explore_meta(result):
         "history_messages": result["context_usage"].get("history_messages", 0),
         "context_compressed": result["context_usage"].get("context_compressed", False),
         "finish_reason": result.get("finish_reason"),
-        "num_ctx": config.NUM_CTX,
+        "num_ctx": config.FRONT_NUM_CTX,
         "selection_reason": result["reason"],
     }
     if result["timed_out"]:
@@ -238,11 +264,20 @@ async def _compact(session_id, dropped):
 
     不能每次对全量丢弃内容重算——摘要容量固定，新内容会挤掉最早的
     暗号与约束。这里按 `covered_messages` 只合并新增部分，并要求旧摘要
-    中的事实原样保留。
+    中的事实原样保留。同会话并发请求经 per-session 锁串行化，
+    避免重复摘要与 covered_messages 回退。
 
     返回 `(summary, cached, took_ms)`；失败时 summary 为空串，主链路
     照常按原逻辑丢弃——压缩是增强，不是新的失败点。
     """
+    lock = _compact_locks.get(session_id)
+    if lock is None:
+        lock = _compact_locks[session_id] = asyncio.Lock()
+    async with lock:
+        return await _compact_locked(session_id, dropped)
+
+
+async def _compact_locked(session_id, dropped):
     limit = config.COMPACTION_MAX_SUMMARY_CHARS
     prev = store.get_session_summary(session_id)
     covered = int(prev["covered_messages"]) if prev else 0
@@ -265,11 +300,14 @@ async def _compact(session_id, dropped):
             prompt = compaction.merge_prompt(prev["summary"], new_part, limit)
         else:
             prompt = compaction.build_prompt(new_part, limit)
-        summary = await front.chat(
-            [{"role": "system", "content": compaction.SUMMARIZE_SYSTEM},
-             {"role": "user", "content": prompt}],
-            max_tokens=min(1024, int(limit * 1.5)),
-            temperature=0.1)
+        # 摘要调用同样持 front_chat_lock：与其它请求的即时回复串行，
+        # 避免前台实例的 last_finish_reason / last_timings 被并发覆写
+        async with front_chat_lock:
+            summary = await front.chat(
+                [{"role": "system", "content": compaction.SUMMARIZE_SYSTEM},
+                 {"role": "user", "content": prompt}],
+                max_tokens=min(1024, int(limit * 1.5)),
+                temperature=0.1)
     except Exception as exc:
         print(f"[compaction] failed: {type(exc).__name__}: {exc}", flush=True)
         return "", False, 0
@@ -329,9 +367,9 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
             status_code=429,
             detail=f"后台队列已满（上限 {config.QUEUE_MAXSIZE}），请稍后重试")
 
-    # 自动上下文预算：短输入多带历史，长输入自动收紧，绝不越过 num_ctx
-    _available = max(0, config.NUM_CTX - config.FRONT_MAX_TOKENS
-                     - config.CONTEXT_SAFETY_TOKENS - len(config.FRONT_SYSTEM))
+    # 自动上下文预算：短输入多带历史，长输入自动收紧，绝不越过前台窗口
+    # （local 前台 = NUM_CTX；api 前台 = 该槽位 context_window）
+    _available = max(0, config.front_ctx_available())
     _remaining = max(0, _available - len(text))
     history_budget = min(
         _remaining,
@@ -379,7 +417,7 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
         system += f"\n当前后台任务：{desc}。用户若问进度，据实简要说明，不要编造结果。"
 
     context_usage = {
-        "num_ctx": config.NUM_CTX,
+        "num_ctx": config.FRONT_NUM_CTX,
         "input_chars": len(text),
         "history_chars": history_chars,
         "history_messages": len(history),
@@ -415,12 +453,15 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
     clean_instant = ""
     front_finish = "stop"
     try:
-        if not await ensure_front():
-            raise RuntimeError("前台模型不可用且处于重启冷却期")
-        clean_instant = await front.chat(messages, max_tokens=config.FRONT_MAX_TOKENS,
-                                         temperature=0.4)
-        # 前台同样会撞 max_tokens；停止原因必须透传，否则半句话会被当成完整回答
-        front_finish = front.last_finish_reason or "stop"
+        # 前台实例会被即时回复与压缩摘要并发调用；last_finish_reason /
+        # last_timings 是实例级共享属性，串行化避免并发交叉覆写
+        async with front_chat_lock:
+            if not await ensure_front():
+                raise RuntimeError("前台模型不可用且处于重启冷却期")
+            clean_instant = await front.chat(
+                messages, max_tokens=config.FRONT_MAX_TOKENS, temperature=0.4)
+            # 前台同样会撞 max_tokens；停止原因必须透传，否则半句话会被当成完整回答
+            front_finish = front.last_finish_reason or "stop"
     except Exception as exc:
         clean_instant = prompts.front_failure(exc)
     instant = clean_instant.rstrip() + progress_note if progress_note else clean_instant
@@ -431,7 +472,8 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
 
     task_id = str(uuid.uuid4())
     if not needs_backend:
-        store.create_task(task_id, session_id, text, tier, clean_instant, reason)
+        store.create_task(task_id, session_id, text, tier, clean_instant, reason,
+                      num_ctx=config.FRONT_NUM_CTX)
         store.update_task(task_id, status="completed", progress=100,
                           final_reply=clean_instant, finish_reason=front_finish,
                           release_info="简单任务由前台槽位直接完成")
@@ -445,7 +487,8 @@ async def _pipeline(text, session_id, prefer_tier, base_url,
             "timed_out": False, "error": "", "finish_reason": front_finish,
         }
 
-    store.create_task(task_id, session_id, text, tier, clean_instant, reason)
+    store.create_task(task_id, session_id, text, tier, clean_instant, reason,
+                      num_ctx=config.FRONT_NUM_CTX)
     try:
         queue.put_nowait(task_id)
     except asyncio.QueueFull:
@@ -530,6 +573,8 @@ async def health():
         # 顶层保留兼容字段，旧客户端与测试脚本可直接读
         "backend": config.GPU_BACKEND,
         "num_ctx": config.NUM_CTX,
+        "started_at": STARTED_AT,
+        "uptime_s": max(0, int(time.time()) - STARTED_AT),
         "frontend": "ready" if (front and await front.healthy()) else "down",
         "frontend_load_ms": front.load_ms if front else None,
         "slot": slot.describe() if slot else {},
@@ -555,6 +600,251 @@ async def config_info():
 @app.get("/tasks")
 async def tasks(limit: int = Query(20, ge=1, le=200)):
     return JSONResponse({"code": 200, "tasks": store.list_tasks(limit)})
+
+
+@app.get("/console")
+async def console():
+    """内置 Web 控制台（单文件页面，无外部依赖）。"""
+    return HTMLResponse(console_page())
+
+
+def _require_admin(request: Request, write: bool = False):
+    """管理接口守卫。
+
+    - 设置了 ADMIN_TOKEN：写操作校验 X-Admin-Token 请求头（不接受 query 参数，
+      避免令牌落访问日志）；
+    - 未设置令牌：沿用 127.0.0.1 信任边界，但写操作额外校验 Origin/Host 与
+      Content-Type，防跨站 CSRF（恶意网页可用 no-cors 表单 POST 打本机端口）。
+    """
+    if write:
+        origin = request.headers.get("Origin")
+        host = (request.headers.get("Host") or "").split(":")[0]
+        if origin:
+            o_host = origin.split("://")[1].split(":")[0] if "://" in origin else ""
+            if o_host != host:
+                raise HTTPException(status_code=403,
+                                    detail="Origin 与服务地址不符，已拒绝跨站写操作")
+        if host and host not in ("127.0.0.1", "localhost", "::1"):
+            raise HTTPException(status_code=403,
+                                detail=f"Host 头异常（{host}），已拒绝写操作")
+        if request.method == "POST":
+            ctype = (request.headers.get("Content-Type") or "").split(";")[0].strip()
+            if ctype != "application/json":
+                raise HTTPException(status_code=415,
+                                    detail="Content-Type 必须是 application/json")
+    if not ADMIN_TOKEN:
+        return
+    token = request.headers.get("X-Admin-Token") or ""
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401,
+                            detail="admin token 无效（请求头 X-Admin-Token）")
+
+
+def _jsonable(v):
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return str(v)
+
+
+@app.get("/admin/config")
+async def admin_config(request: Request):
+    """生效配置 + 可热调参数元数据（当前值 / 基础值 / 分组 / 说明）。"""
+    _require_admin(request)
+    data = config.describe()
+    data["admin_token_required"] = bool(ADMIN_TOKEN)
+    data["hot_params"] = {
+        k: {
+            "label": spec["label"], "group": spec["group"],
+            "yaml_path": list(spec["yaml"]),
+            "current": _jsonable(getattr(config, k)),
+            "base": _jsonable(config.HOT_PARAM_BASE[k]),
+            "changed": _jsonable(getattr(config, k)) != _jsonable(config.HOT_PARAM_BASE[k]),
+        }
+        for k, spec in config.HOT_PARAMS.items()
+    }
+    return JSONResponse(data)
+
+
+@app.post("/admin/config")
+async def admin_config_set(request: Request):
+    """热调参数：{参数名: 值}。立即生效并持久化到 settings.local.yaml。"""
+    _require_admin(request, write=True)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 {参数名: 值} 映射")
+    applied, err = config.apply_runtime_params(body)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    return JSONResponse({"code": 200, "status": "success", "applied": applied,
+                         "note": "已写入 settings.local.yaml，重启后仍生效"})
+
+
+@app.delete("/admin/config/{name}")
+async def admin_config_reset(name: str, request: Request):
+    """恢复参数为 import 时的基础值，并从覆盖层移除。"""
+    _require_admin(request, write=True)
+    value, err = config.reset_runtime_param(name)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    return JSONResponse({"code": 200, "status": "success", "reset": name,
+                         "value": _jsonable(value)})
+
+
+# ---- 配置管理：启动期参数（槽位/模型/端口等）与重启 -------------------------
+# 修改写入 settings.local.yaml 覆盖层（settings.yaml 注释不受影响），
+# 保存时用真实子进程导入做预检，重启后生效。热调参数走 /admin/config。
+
+_RESTART_CHILD = '''
+import json, os, socket, subprocess, sys, time
+spec = json.loads(sys.argv[1])
+time.sleep(1.0)
+env = os.environ.copy()
+env["PYTHONPATH"] = spec["pythonpath"] + os.pathsep + env.get("PYTHONPATH", "")
+# 端口以「候选配置实际解析值」为准：覆盖层可能改过 runtime.ports.api
+port = spec["port"]
+try:
+    sys.path.insert(0, spec["pylib"])
+    sys.path.insert(0, spec["root"])
+    from app import config as _cfg
+    port = int(_cfg.API_PORT)
+except Exception as _e:
+    print(f"[restart] resolve API_PORT failed, fallback {port}: {_e}", flush=True)
+argv = list(spec["argv"])
+if "--port" in argv:
+    argv[argv.index("--port") + 1] = str(port)
+# 等旧实例退出（API 端口释放）再拉新实例：优雅关闭可能远超固定秒数
+# （SSE 排空最长 wait_timeout_s + 模型进程退出），固定 sleep 会抢端口失败
+deadline = time.time() + 90
+while time.time() < deadline:
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        if s.connect_ex(("127.0.0.1", port)) != 0:
+            break
+    time.sleep(1.0)
+lf = open(spec["log"], "ab")
+kw = ({"start_new_session": True} if os.name == "posix"
+      else {"creationflags": 0x00000008 | 0x00000200})
+p = subprocess.Popen(argv, stdout=lf, stderr=subprocess.STDOUT,
+                     cwd=spec["cwd"], env=env, **kw)
+with open(spec["pid_file"], "w") as f:
+    f.write(str(p.pid))
+print(f"[restart] new instance pid={p.pid} port={port}", flush=True)
+'''
+
+
+def _restart_child_spec():
+    pid_file = os.getenv("PID_FILE", str(config.DATA / "router.pid"))
+    log_file = os.getenv("LOG", str(config.LOGS / "api.log"))
+    return {
+        "argv": [sys.executable, "-m", "uvicorn", "app.main:app",
+                 "--host", "127.0.0.1", "--port", str(config.API_PORT),
+                 "--workers", "1"],
+        "port": int(config.API_PORT),
+        "pythonpath": os.pathsep.join([str(config.ROOT), str(config.ROOT / "pylib")]),
+        "root": str(config.ROOT),
+        "cwd": str(config.ROOT),
+        "log": log_file,
+        "pid_file": pid_file,
+    }
+
+
+@app.get("/admin/settings")
+async def admin_settings(request: Request):
+    """全量启动期配置编辑视图：字段 + 中文注释 + 当前值 + 来源。"""
+    _require_admin(request)
+    return JSONResponse(config.settings_schema())
+
+
+@app.post("/admin/settings")
+async def admin_settings_set(request: Request):
+    """写入/移除/删除启动期配置（覆盖层），预检通过后落盘，重启生效。
+
+    body: {"updates": {path: value}, "resets": [path], "removes": [path]}
+    - updates：写覆盖值（如 slots.cloud.base_url）；api_key 的掩码值 "***" 表示未修改；
+    - resets：移除覆盖值，恢复 settings.yaml 原值；
+    - removes：彻底删除（如删除槽位 slots.moe，settings.yaml 来源同样删掉）。
+    """
+    _require_admin(request, write=True)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是映射")
+    updates = body.get("updates") or {}
+    resets = body.get("resets") or []
+    removes = body.get("removes") or []
+    if not isinstance(updates, dict) or not isinstance(resets, list) \
+            or not isinstance(removes, list):
+        raise HTTPException(
+            status_code=400,
+            detail="格式应为 {updates: {path: value}, resets: [path], removes: [path]}")
+    # api_key 只出掩码；掩码值 = 未修改，直接丢弃，避免把 "***" 写成真密钥
+    updates = {k: v for k, v in updates.items()
+               if not (k.endswith(".api_key") and v == "***")}
+    if not updates and not resets and not removes:
+        raise HTTPException(status_code=400, detail="没有任何变更")
+    candidate, err = config.build_candidate_overlay(updates, resets, removes)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    # 子进程导入耗时数秒：放线程池执行，避免阻塞事件循环冻结在途请求
+    ok, verr = await asyncio.to_thread(config.validate_overlay, candidate)
+    if not ok:
+        raise HTTPException(status_code=400,
+                            detail=f"配置预检失败（未保存）: {verr}")
+    config.commit_overlay(candidate)
+    return JSONResponse({
+        "code": 200, "status": "saved",
+        "applied": {"updates": sorted(updates), "resets": resets,
+                    "removes": removes},
+        "note": "已写入 settings.local.yaml 并通过启动预检；重启服务后生效",
+    })
+
+
+@app.post("/admin/restart")
+async def admin_restart(request: Request):
+    """重启服务：先做配置预检（起不来就拒绝重启），再优雅退出并由
+    守护子进程用相同参数拉起新实例。子进程会等旧实例退出（API 端口释放）
+    后才拉起新实例；前端轮询 /health（started_at 变化）等待恢复。"""
+    global RESTARTING
+    _require_admin(request, write=True)
+    if RESTARTING:
+        raise HTTPException(status_code=409,
+                            detail="重启已在进行中，请等待服务恢复后再操作")
+    ok, err = await asyncio.to_thread(
+        config.validate_overlay, copy.deepcopy(config.OVERLAY_LOADED))
+    if not ok:
+        raise HTTPException(status_code=400,
+                            detail=f"配置预检失败，已取消重启: {err}")
+    RESTARTING = True
+    subprocess.Popen(
+        [sys.executable, "-c", _RESTART_CHILD, json.dumps(_restart_child_spec())],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=str(config.ROOT),
+        start_new_session=(os.name == "posix"),
+        creationflags=(0x00000008 | 0x00000200) if os.name != "posix" else 0)
+
+    async def _shutdown_soon():
+        await asyncio.sleep(0.8)
+        print("[restart] graceful shutdown requested via /admin/restart",
+              flush=True)
+        if os.name == "posix":
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            signal.raise_signal(signal.SIGINT)
+
+    asyncio.create_task(_shutdown_soon())
+    return JSONResponse({
+        "code": 200, "status": "restarting",
+        "note": "配置预检通过，服务正在优雅重启（通常 3-15 秒），可轮询 /health 等待恢复",
+    })
 
 
 async def _stream_completion(parsed, result, req_id, created):

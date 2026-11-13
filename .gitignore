@@ -72,6 +72,9 @@ matrix_*.json
 id_rsa*
 id_ed25519*
 
+# --- 运行期参数覆盖层（控制台 / CLI 热调写入，机器本地文件）---
+settings.local.yaml
+
 # --- 说明 ---
 # storage/task_status/*.json 为旧版历史任务归档，作为项目历史证据保留在库中。
 # 若日后不再需要，追加 storage/task_status/ 即可。

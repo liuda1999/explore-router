@@ -11,6 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 TARGETS = (
     sorted((ROOT / "app").glob("*.py"))
     + [ROOT / "run.sh"]
+    + ([ROOT / "cli.py"] if (ROOT / "cli.py").exists() else [])
     + sorted((ROOT / "tests").glob("*.py"))
     + sorted((ROOT / "tests").glob("*.sh"))
 )

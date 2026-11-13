@@ -77,6 +77,10 @@ class LlamaServer:
             return ""
 
     async def start(self):
+        if os.name != "posix":
+            raise RuntimeError(
+                "local 槽位需要 POSIX 进程管理（llama-server 子进程）；"
+                "Windows 开发机请使用 type: api 槽位")
         if not self.model_path.exists():
             raise RuntimeError(f"model file missing: {self.model_path}")
         plan = config.VRAM_PLAN.get(self.name)
@@ -101,14 +105,22 @@ class LlamaServer:
             env["LD_LIBRARY_PATH"] = config.LLAMA_LIB_DIR + ":" + env.get("LD_LIBRARY_PATH", "")
         env["GGML_CUDA_NO_PINNED"] = "1"
         self._log = open(config.LOGS / f"{self.name}.log", "ab", buffering=0)
-        self.proc = subprocess.Popen(
-            self._cmd(), env=env, stdout=self._log, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                self._cmd(), env=env, stdout=self._log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            self._log.close()
+            self._log = None
+            raise
         self.started_at = time.time()
         try:
             await self.wait_ready()
-        except Exception:
+        except BaseException:
+            # BaseException 兜住 CancelledError：关机/重启取消时若已 spawn
+            # 而未就绪，进程必须被回收，否则成孤儿占住端口与显存，
+            # 新实例会因 port already in use 起不来
             await self.stop()
             raise
         self.load_ms = round((time.time() - self.started_at) * 1000, 1)
@@ -205,21 +217,33 @@ class LlamaServer:
 
     async def stop(self):
         if self.proc and self.proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.to_thread(self.proc.wait, 20)
-            except Exception:
+            if os.name == "posix":
                 try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
                 except ProcessLookupError:
                     pass
                 try:
-                    await asyncio.to_thread(self.proc.wait, 5)
+                    await asyncio.to_thread(self.proc.wait, 20)
                 except Exception:
-                    pass
+                    try:
+                        os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.to_thread(self.proc.wait, 5)
+                    except Exception:
+                        pass
+            else:
+                # Windows 开发机路径：无进程组语义，直接 terminate/kill
+                self.proc.terminate()
+                try:
+                    await asyncio.to_thread(self.proc.wait, 10)
+                except Exception:
+                    self.proc.kill()
+                    try:
+                        await asyncio.to_thread(self.proc.wait, 5)
+                    except Exception:
+                        pass
         self.proc = None
         if self._log:
             try:

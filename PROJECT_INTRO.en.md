@@ -1,8 +1,15 @@
 # explore · Intelligent Local LLM Router — Project Introduction
 
-> **Version** v2.4.0 ｜ **Updated** 2026-11-08 ｜ **Configuration-driven edition**
+> **Version** v2.5.0 ｜ **Updated** 2026-11-14 ｜ **Configuration-driven edition + online API slots**
 > Workspace: `<deployment directory>` (scripts resolve paths from their own location; nothing is hard-coded)
 > Bilingual entry point: [README.md](README.md) ｜ 中文版: [PROJECT_INTRO.md](PROJECT_INTRO.md)
+>
+> **New in v2.5.0**: ① Slots support `type: api` — OpenAI-compatible cloud models,
+> including the resident front slot; ② N-tier routing (`tier_thresholds` /
+> `tier_complex_words` / `tier_fallbacks`); ③ Built-in Web console (`GET /console`)
+> + `/admin/config` hot parameter tuning persisted to `settings.local.yaml`;
+> ④ Python CLI (`python3 cli.py`). The Chinese edition documents these in depth;
+> semantics are identical.
 
 ---
 
@@ -77,7 +84,7 @@ The project began with a practical constraint: a single 16 GB GPU cannot hold se
 flowchart TD
     C[Client · session_id] -->|POST /chat| A[FastAPI · app/main.py]
     A --> S[(SQLite · app/store.py<br/>history + task state machine)]
-    A --> E[ONNX Embedding · app/embed.py<br/>semantic cues]
+    A --> E[Embedding app/embed.py<br/>semantic clues ONNX / Ollama]
     A --> F[FRONT slot · resident=true<br/>always online · instant reply]
     F -->|simple| D[direct · answered inline]
     F -->|progress question| P[attach real task state]
@@ -102,7 +109,7 @@ flowchart TD
 | `app/config.py` | Read `settings.yaml`, apply env overrides, probe backend, resolve `num_ctx`, compute history budget and `vram_plan`, derive slot devices and split ratios, `describe()` | Concrete model names or GPU indices |
 | `app/gpu.py` | GPU snapshot: backend, visible devices, model names, total/free VRAM; honours `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` | Vendor-specific constants |
 | `app/llama.py` | Start/stop `llama-server`, port readiness, runtime VRAM re-check, chat with `/completion` fallback, disable thinking, KV precision and multi-GPU split flags | Hardware feasibility decisions |
-| `app/embed.py` | ONNX embedding load + inference, startup self-check of vector dimension (currently 1024) | Task classification |
+| `app/embed.py` | Embedding inference (provider: onnx local ONNX / ollama remote e.g. bge-m3), startup self-check prints dim (1024); degrades to text-only clues on failure | Not involved in routing |
 | `app/store.py` | SQLite `messages` / `tasks`; merge consecutive same-role messages, budget-truncate and normalise history, task state machine, restart recovery | Cross-session retrieval |
 | `app/router.py` | Classification, `tier_to_slot` mapping, static `VRAM_PLAN` selection/degradation, mutually-exclusive `ensure()` | Assumption that exactly three slots exist |
 | `app/prompts.py` | **Central message templates**: backend system, task package, result/progress prefixes, truncation marker, degradation text; `PROMPT_VERSION` identifies the revision | No routing decisions, no config access |
@@ -146,7 +153,7 @@ Every cross-module message is produced by `app/prompts.py`; `PROMPT_VERSION` ide
 | Backend result (history) | `prompts.history_message()` | `[后台结果] ` + raw output | Yes |
 | Progress note | `prompts.progress_note()` | `[后台任务进度] ` + real task state | No (instant reply only) |
 | Front degradation | `prompts.front_failure()` | fixed sentence with exception type, no stack trace | Yes (as a clean reply) |
-| Oversized input | `prompts.TRUNCATION_MARK` | keeps first 2/3 and last 1/3, marks the cut | No (task package only) |
+| Oversized input | `prompts.TRUNCATION_MARK` | keeps whole paragraphs/sentences at the boundary (head 2/3 + tail, middle elided with an omission count)
 | History truncation | `prompts.HISTORY_TRUNCATED_NOTE` | fixed notice that earlier records are unavailable and must not be replaced or guessed | No (system only) |
 
 Three hard constraints:
@@ -411,6 +418,7 @@ Verified: API 27/27, fault injection 10/10, restart recovery 10/10, stability 10
 
 ## 15. Known limitations
 
+- **API slots (v2.5) depend on external services**: availability, latency and billing are the cloud provider's; API keys are injected via environment variables and never logged; `context_window` is the declared value of the remote model — history budgeting is estimated from it and should be calibrated to the real model.
 - **Model quality**: with the example configuration, the 9B middle model often returns 15–22 characters and sometimes repeats the input; the 35B MoE also returns only ~20 characters for "one sentence each" requests. This is a model-quality issue — swap in a stronger model or tune prompts; the pipeline is unaffected.
 - **Weak instruction following in the small front model**: progress information is guaranteed by the API layer attaching real state; when reading back a backend result the front may occasionally invent "still processing" — **trust `final_reply`**.
 - **`num_ctx: auto` is a heuristic lookup**, not an exact VRAM solver; calibrate `auto_table` on a new device.
@@ -432,7 +440,7 @@ Verified: API 27/27, fault injection 10/10, restart recovery 10/10, stability 10
 |---|---|
 | Physical AMD ROCm validation | Static layer + short integration on a single 16 GB AMD card; calibrate `vram_mb` and `auto_table` |
 | Streaming output | SSE for front replies and backend results, reducing polling |
-| Auth and rate limiting | Minimal security layer for non-localhost access |
+| Auth and rate limiting | Minimal security layer for non-localhost access (an optional `ADMIN_TOKEN` already guards `/admin` writes) |
 | Operational hardening | Log rotation, DB archiving, metrics export |
 | More precise VRAM planning | Replace `vram_mb` estimates with actual runtime usage |
 | Prompt / output quality | Adjustable templates for short replies and tone mismatch, without changing verbatim delivery semantics |

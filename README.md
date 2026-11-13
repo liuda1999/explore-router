@@ -33,6 +33,11 @@ The original constraint was a single 16 GB GPU that could not hold several large
 | **Constant context window** | `num_ctx` is resolved once at startup and applied to every instance. Switching models never changes it. Minimum supported is **32K**. |
 | **Verbatim result delivery** | Backend output is written to `final_reply` unchanged — the front model does not rewrite or summarise it. |
 | **OpenAI-compatible** | `/v1/chat/completions`, `/v1/responses` and `/v1/models` work with Cherry Studio / Open WebUI / Dify: `final` mode waits for the backend, `instant` mode returns the front reply plus a `task_id`. |
+| **Online API slots (v2.5)** | Any slot — including the resident front — can be `type: api`: an OpenAI-compatible cloud model (DeepSeek, Qwen, GLM, …). API slots use no local VRAM, never trigger slot switches, and can serve as a tier target, an extra tier, or a degrade fallback for local slots. |
+| **Embedding via Ollama (v2.5)** | `embedding.provider: onnx` (default, local ONNX, CPU) or `ollama` (e.g. `bge-m3`) — no local model files / numpy / onnxruntime needed; graceful fallback to keyword-only clues either way. |
+| **N-tier routing (v2.5)** | `routing.tier_order` supports 3+ tiers with per-tier thresholds (`tier_thresholds`), per-tier keyword lists (`tier_complex_words`) and a per-tier degrade chain (`tier_fallbacks`). New tiers appear automatically as `explore-<tier>` model names. |
+| **Hot config + Web console (v2.5)** | `GET /console` (single-file page, no external assets) + `/admin/config` hot-adjust ~19 runtime parameters (thresholds, word lists, output caps, system prompt, compaction…). Changes apply immediately and persist to `settings.local.yaml`; reset restores the `settings.yaml` base value. The「配置管理」panel edits startup params (slots/models/ports/num_ctx) with per-field comments, validates via a real import pre-check, and one-click restarts the service. |
+| **CLI (v2.5)** | `python3 cli.py start/stop/status/health`, `config get/set/reset/validate`, `chat`, `task/tasks/models`, `logs`, `check-api <slot>` — stdlib only, mirrors `run.sh` semantics. |
 | **Observable progress** | Asking "how is it going" attaches the real task state from SQLite, not a generated guess. |
 | **Automatic VRAM guard** | `vram_plan` evaluates visible GPUs at startup. A slot that does not fit is marked `available: false`; heavy requests degrade to `default_slot` instead of OOM-ing. Multi-GPU layer split is derived from free VRAM at startup — no hard-coded ratio. |
 | **Automatic context budget** | History budget scales with `num_ctx` and shrinks when the current input is long. Long chains stay stable and recall stays accurate. |
@@ -45,7 +50,7 @@ The original constraint was a single 16 GB GPU that could not hold several large
 flowchart TD
     C[Client · session_id] -->|POST /chat| A[FastAPI API layer]
     A --> S[(SQLite<br/>sessions + task state)]
-    A --> E[ONNX Embedding<br/>semantic cues]
+    A --> E[Embedding<br/>ONNX / Ollama]
     A --> F[FRONT slot · resident=true]
     F -->|simple| D[direct answer · instant_reply]
     F -->|progress question| P[attach real task state]
@@ -69,11 +74,11 @@ flowchart TD
 | Async HTTP | httpx 0.28.1 |
 | Inference runtime | `llama-server` (llama.cpp), GGUF, OpenAI-compatible endpoints |
 | GPU backends | NVIDIA CUDA / AMD ROCm / CPU, auto-detected |
-| Embedding | ONNX Runtime 1.23.2 + tokenizers 0.23.3 (bge-zh, 1024-d, CPU) |
+| Embedding | ONNX Runtime (local ONNX, CPU) or Ollama embeddings API (e.g. bge-m3, 1024-d) |
 | State | SQLite (`messages` + `tasks`), no Redis / Celery / broker |
 | Config | PyYAML 6.0.3, single `settings.yaml` + deployment-time env overrides |
 | Numeric | numpy 2.2.6 |
-| Process control | `run.sh` (idempotent start / stop / restart / status / health), PID file |
+| Process control | `run.sh` (idempotent start / stop / restart / status / health), PID file; `cli.py` (Python, stdlib only) |
 | Tests | Real-machine Python test suite + shell matrix runner + CI static / GPU integration layers |
 
 Full detail, version pinning rationale and alternatives: **[TECH_STACK.md](TECH_STACK.md)**.
@@ -97,11 +102,16 @@ python3 -m pip install --target ./pylib -r requirements.txt
 #    - context.num_ctx        -> auto (min 32K) or an explicit integer
 
 # 4. Start (idempotent, foreground readiness wait, no boot-time autostart)
-./run.sh start --wait
+./run.sh start --wait          # or: python3 cli.py start --wait
 
 # 5. Always confirm the *effective* configuration first
 curl -s http://127.0.0.1:8100/config
 curl -s http://127.0.0.1:8100/health
+
+# 6. Optional: built-in Web console & CLI for hot parameter tuning
+#    Browser: http://127.0.0.1:8100/console
+python3 cli.py config validate
+python3 cli.py config set FRONT_MAX_TOKENS 320   # applies immediately + persists
 ```
 
 First request:
@@ -159,7 +169,7 @@ Stop cleanly (only this project's PID and configured ports are touched):
 
 ### Verified status
 
-Audited on real hardware with real models, real process crashes and real restarts — **no mocks**: API contract 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long-context 15/15 per context tier, 32K/64K/96K matrix 69/69, OpenAI compatibility **38/38** (chat/completions) and **41/41** (Responses), pre-release acceptance **93/93** (including compaction and early recall), single-GPU degradation verified, CI `STATIC_OK + INTEGRATION_OK`. See [AUDIT_REPORT.md](AUDIT_REPORT.md) and [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md). All performance figures there are **device-specific historical measurements**, not project limits.
+Audited on real hardware with real models, real process crashes and real restarts — **no mocks**: API contract 27/27, fault injection 10/10, restart recovery 10/10, stability 10/10, long-context 15/15 per context tier, 32K/64K/96K matrix 69/69, OpenAI compatibility **38/38** (chat/completions) and **41/41** (Responses), pre-release acceptance **93/93** (including compaction and early recall), single-GPU degradation verified, CI `STATIC_OK + INTEGRATION_OK`. v2.5 additions (any machine, no GPU needed): api-slot full pipeline **21/21** (`tests/test_api_slot.py`), admin & settings-editor & restart **34/34** (`tests/test_admin_api.py`, includes two real restarts), CLI **9/9** (`tests/test_cli.py`), config static checks **23/23**, paragraph-truncation behavior **10/10** (`tests/test_truncation_behavior.py`), real-model smoke with local Ollama **31/31** (`tests/test_real_model_smoke.py`). See [AUDIT_REPORT.md](AUDIT_REPORT.md) and [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md). All performance figures there are **device-specific historical measurements**, not project limits.
 
 ### Documentation
 
@@ -172,6 +182,7 @@ Audited on real hardware with real models, real process crashes and real restart
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Deployment & startup runbook, hardware scenarios, acceptance checklist |
 | [OPERATIONS.md](OPERATIONS.md) | Day-2 operations: swap models / devices, monitoring, troubleshooting, rollback |
 | [AUDIT_REPORT.md](AUDIT_REPORT.md) | Full real-machine audit and CI results |
+| [CODE_AUDIT_REPORT.md](CODE_AUDIT_REPORT.md) | v2.5.0 static code audit (no-GPU): 28 findings fixed, security/Concurrency/Portability |
 | [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md) | Pre-release acceptance stress test: long context, concurrency, streaming, log checks |
 | [TEST_REPORT.md](TEST_REPORT.md) | Historical device-specific measurements |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | Historical development log (requirements evolution, not a current constraint) |
@@ -212,6 +223,11 @@ You may use, modify and redistribute this project, including commercially, provi
 | **上下文恒定** | `num_ctx` 启动时解析一次并应用到所有实例，切换模型不改变它；最低支持 **32K**。 |
 | **结果原样递回** | 后台输出直接写入 `final_reply`，前台不改写、不整理。 |
 | **OpenAI 兼容** | `/v1/chat/completions`、`/v1/responses`、`/v1/models` 可直接接入 Cherry Studio / Open WebUI / Dify：`final` 模式等后台完成，`instant` 模式立即回即时回复并给 `task_id`。 |
+| **线上 API 槽位（v2.5）** | 任意槽位——包括常驻前台——都可以是 `type: api`：OpenAI 兼容的云端模型（DeepSeek / Qwen / GLM 等）。api 槽位不占本地显存、不触发槽位切换，可作为档位映射目标、新增档位或本地槽位的降级备选。 |
+| **嵌入模型可接 Ollama（v2.5）** | `embedding.provider: onnx`（默认，本地 ONNX，CPU）或 `ollama`（如 `bge-m3`）——无需本地模型文件 / numpy / onnxruntime；任一 provider 失败都降级为纯文本线索。 |
+| **N 档分级（v2.5）** | `routing.tier_order` 支持 3+ 档：每档阈值（`tier_thresholds`）、每档专属词表（`tier_complex_words`）、每档降级链（`tier_fallbacks`）全部可配；新档位自动出现 `explore-<档位>` 模型名。 |
+| **热参数 + Web 控制台（v2.5）** | `GET /console`（单文件页面、无外部资源）+ `/admin/config` 可热调约 19 个运行期参数（分级阈值、词表、输出上限、system 提示词、压缩参数…），立即生效并持久化到 `settings.local.yaml`；重置恢复 settings.yaml 基础值。「配置管理」面板带注释编辑全部启动期参数（槽位/模型/端口/num_ctx），保存前真实导入预检，并支持一键重启。 |
+| **CLI（v2.5）** | `python3 cli.py start/stop/status/health`、`config get/set/reset/validate`、`chat`、`task/tasks/models`、`logs`、`check-api <槽位>`——仅标准库，与 run.sh 同一套语义。 |
 | **进度可观测** | 用户问进度时附加来自 SQLite 的真实任务状态，而不是模型编造。 |
 | **显存自动阈值** | `vram_plan` 按启动期可见 GPU 判断；装不下的槽位标 `available: false`，heavy 自动降级到 `default_slot`，不强行加载导致 OOM。多卡分层比例按启动期空闲显存自动推导，不写死。 |
 | **上下文自动预算** | 历史预算随 `num_ctx` 伸缩，当前输入变长时自动收紧，保证长链路稳定与召回准确。 |
@@ -224,7 +240,7 @@ You may use, modify and redistribute this project, including commercially, provi
 flowchart TD
     C[客户端 · session_id] -->|POST /chat| A[FastAPI 接口层]
     A --> S[(SQLite<br/>会话历史 + 任务状态)]
-    A --> E[ONNX Embedding<br/>语义线索]
+    A --> E[嵌入层<br/>ONNX / Ollama]
     A --> F[FRONT 槽位 · resident=true]
     F -->|简单任务| D[直接回答 · instant_reply]
     F -->|进度提问| P[附加真实任务状态]
@@ -252,7 +268,7 @@ flowchart TD
 | 状态 | SQLite（`messages` + `tasks`），无 Redis / Celery / 消息中间件 |
 | 配置 | PyYAML 6.0.3，唯一 `settings.yaml` + 部署期环境变量覆盖 |
 | 数值 | numpy 2.2.6 |
-| 进程管理 | `run.sh`（幂等 start / stop / restart / status / health）+ PID 文件 |
+| 进程管理 | `run.sh`（幂等 start / stop / restart / status / health）+ PID 文件；`cli.py`（Python，仅标准库） |
 | 测试 | 真机 Python 用例 + Shell 矩阵 + CI 静态层 / GPU 集成层 |
 
 完整选型理由、版本固定原因与替代方案见 **[TECH_STACK.md](TECH_STACK.md)**；从零部署步骤见 **[DEPLOYMENT.md](DEPLOYMENT.md)**。
@@ -275,11 +291,16 @@ python3 -m pip install --target ./pylib -r requirements.txt
 #    - context.num_ctx       auto（最低 32K）或显式整数
 
 # 4. 启动（幂等；--wait 等待前台就绪；不设开机自启）
-./run.sh start --wait
+./run.sh start --wait          # 或：python3 cli.py start --wait
 
 # 5. 换模型/换设备后，先确认「实际生效」的配置
 curl -s http://127.0.0.1:8100/config
 curl -s http://127.0.0.1:8100/health
+
+# 6. 可选：内置 Web 控制台与 CLI 热调参数
+#    浏览器打开：http://127.0.0.1:8100/console
+python3 cli.py config validate
+python3 cli.py config set FRONT_MAX_TOKENS 320   # 立即生效并持久化
 ```
 
 第一个请求：
@@ -337,7 +358,7 @@ curl -s -X POST http://127.0.0.1:8100/v1/responses \
 
 ### 验证状态
 
-真机、真模型、真实进程故障与真实重启审计，**全程不使用 mock**：API 契约 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 **38/38**（chat/completions）与 **41/41**（Responses）、发布前验收压测 **93/93**（含上下文压缩与早期召回）、单卡降级已验证、CI `STATIC_OK + INTEGRATION_OK`。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。其中所有性能数字都是**特定设备的历史实测**，不是项目约束或能力边界。
+真机、真模型、真实进程故障与真实重启审计，**全程不使用 mock**：API 契约 27/27、故障注入 10/10、重启恢复 10/10、稳定性 10/10、长上下文每档 15/15、32K/64K/96K 矩阵 69/69、OpenAI 兼容层 **38/38**（chat/completions）与 **41/41**（Responses）、发布前验收压测 **93/93**（含上下文压缩与早期召回）、单卡降级已验证、CI `STATIC_OK + INTEGRATION_OK`。v2.5 新增（任意机器、无需 GPU）：api 槽位全链路 **21/21**（`tests/test_api_slot.py`）、管理接口+配置管理+重启 **34/34**（`tests/test_admin_api.py`，含两次真实重启）、CLI **9/9**（`tests/test_cli.py`）、配置静态检查 **23/23**、段落边界截断行为 **10/10**（`tests/test_truncation_behavior.py`）、本机 Ollama 真实模型冒烟 **31/31**（`tests/test_real_model_smoke.py`）。详见 [AUDIT_REPORT.md](AUDIT_REPORT.md) 与 [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md)。其中所有性能数字都是**特定设备的历史实测**，不是项目约束或能力边界。
 
 ### 文档索引
 
@@ -350,6 +371,7 @@ curl -s -X POST http://127.0.0.1:8100/v1/responses \
 | [DEPLOYMENT.md](DEPLOYMENT.md) | 部署与启动流程、硬件场景、验收清单 |
 | [OPERATIONS.md](OPERATIONS.md) | 日常运维：换模型 / 换设备、监控、排障、回滚 |
 | [AUDIT_REPORT.md](AUDIT_REPORT.md) | 全量真机审计与 CI 结果 |
+| [CODE_AUDIT_REPORT.md](CODE_AUDIT_REPORT.md) | v2.5.0 代码审计（无 GPU 静态+全链路）：28 项发现全部修复 |
 | [ACCEPTANCE_REPORT.md](ACCEPTANCE_REPORT.md) | 发布前验收压测：长上下文、并发、流式、日志核查 |
 | [TEST_REPORT.md](TEST_REPORT.md) | 特定设备的历史实测 |
 | [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) | 历史开发记录（需求演进，非当前约束） |

@@ -21,6 +21,24 @@ jobs:
       - name: 运行静态层
         run: bash tests/ci_static.sh
 
+  functional:
+    name: 功能链路（无 GPU：api 槽位 + CLI）
+    runs-on: ubuntu-latest
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: 安装运行依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: api 槽位全链路（自起本地 fake OpenAI 服务）
+        run: python3 tests/test_api_slot.py
+      - name: CLI 离线功能
+        run: python3 tests/test_cli.py
+
   integration:
     name: GPU 集成审计（self-hosted）
     # 需要一台已部署模型与 pylib 的 GPU 机器，并给 runner 打上 gpu 标签。
