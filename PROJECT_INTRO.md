@@ -107,7 +107,7 @@ flowchart TD
 | `app/config.py` | 读 `settings.yaml` 与 `settings.local.yaml` 覆盖层、应用环境变量覆盖、探测后端、解析 `num_ctx`、计算历史预算与 `vram_plan`、生成槽位设备列表与分层比例、N 档阈值、`apply_runtime_params()` 热调、`describe()` | 不含具体模型名与 GPU 编号 |
 | `app/gpu.py` | 快照 GPU：后端（CUDA / ROCm / CPU）、可见卡、型号、总/空闲显存；尊重 `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` | 不含品牌判断常量 |
 | `app/llama.py` | 启动/停止 `llama-server`（`type: local` 槽位），端口就绪检查，运行期显存复查，`chat` 与 `/completion` 兜底，关闭 thinking，KV 精度与多卡分层参数 | 不做硬件可行性决策 |
-| `app/api_backend.py` | **线上 API 槽位后端**（`type: api`）：OpenAI 兼容 `/chat/completions` HTTP 调用，与 LlamaServer 同一调用契约；`create_backend()` 是前后台槽位的唯一工厂 | 不做路由决策；密钥不落日志 |
+| `app/api_backend.py` | **线上 API 槽位后端**（`type: api`）：OpenAI 兼容 `/chat/completions` 与 Ollama 原生 `/api/chat` 调用，与 LlamaServer 同一调用契约；`create_backend()` 是前后台槽位的唯一工厂；**启动自动探测上游上下文长度**（运行时窗口优先，静默截断自适应） | 不做路由决策；密钥不落日志 |
 | `app/embed.py` | 嵌入推理（provider: onnx 本地 ONNX / ollama 远端嵌入如 bge-m3），启动自检输出维度（1024）；失败降级为纯文本线索 | 不参与任务分级 |
 | `app/store.py` | SQLite `messages` / `tasks`；合并连续同角色消息、按预算截断并规范化历史、任务状态机、重启恢复 | 无跨会话检索层 |
 | `app/router.py` | N 档分级（`tier_thresholds` / 每档词表）、`tier_to_slot` 映射与 `tier_fallbacks` 降级链、静态 `VRAM_PLAN` 选槽、后台槽位互斥 `ensure()`（api 槽位直接复用客户端） | 不假设槽位数量与后端形态 |
@@ -231,7 +231,7 @@ slots:
 |---|---|---|
 | 换前台（3B ↔ 4B、换量化） | `front.model` / `quant` / `weight_mb` / `vram_mb` | 否 |
 | 换中档 / 重档（8B ↔ 9B、30B/35B MoE ↔ 稠密模型） | 对应槽位同上 | 否 |
-| **换线上 API / 增加云端槽位（v2.5）** | 新增 `type: api` 槽位（`base_url / model / api_key_env / context_window`），`tier_to_slot` 或 `tier_fallbacks` 指向它 | 否 |
+| **换线上 API / 增加云端槽位（v2.5）** | 新增 `type: api` 槽位（`base_url / model / api_key_env / context_window`），`tier_to_slot` 或 `tier_fallbacks` 指向它；context_window **缺省自动探测上游**（运行时窗口优先） | 否 |
 | **前台换成线上模型（v2.5）** | 前台槽位改 `type: api`，`context_window` 填远端窗口 | 否 |
 | 增减槽位 / 改档位名 / 增删档位 | `slots` + `routing.tier_to_slot`（+ `tier_order` / `tier_thresholds`） | 否 |
 | 换推理运行时 | `runtime.server_bin` / `lib_dir` | 否（接口隔离在 `app/llama.py`） |
